@@ -223,6 +223,7 @@ func (s *Store) GetChat(ctx context.Context, chatID uuid.UUID, forUserID string)
 		SELECT c.id, c.kind,
 		       CASE
 		           WHEN c.kind = 'direct' THEN COALESCE(
+		               NULLIF((SELECT cm_peer.display_name FROM chat_members cm_peer WHERE cm_peer.chat_id = c.id AND cm_peer.user_id != $2 LIMIT 1), ''),
 		               NULLIF((SELECT cm_peer.user_id FROM chat_members cm_peer WHERE cm_peer.chat_id = c.id AND cm_peer.user_id != $2 LIMIT 1), ''),
 		               c.title
 		           )
@@ -238,7 +239,7 @@ func (s *Store) GetChat(ctx context.Context, chatID uuid.UUID, forUserID string)
 }
 
 // GetOrCreateDirectChat находит существующий или создаёт новый прямой диалог 1-на-1 между user1 и user2.
-func (s *Store) GetOrCreateDirectChat(ctx context.Context, user1, user2 string) (*Chat, error) {
+func (s *Store) GetOrCreateDirectChat(ctx context.Context, user1, user2, user1Name, user2Name string) (*Chat, error) {
 	if s == nil || s.pool == nil {
 		return nil, fmt.Errorf("store: nil pool")
 	}
@@ -247,6 +248,14 @@ func (s *Store) GetOrCreateDirectChat(ctx context.Context, user1, user2 string) 
 	user2 = strings.TrimSpace(user2)
 	if user1 == "" || user2 == "" {
 		return nil, fmt.Errorf("store: empty users for direct chat")
+	}
+	user1Name = strings.TrimSpace(user1Name)
+	if user1Name == "" {
+		user1Name = user1
+	}
+	user2Name = strings.TrimSpace(user2Name)
+	if user2Name == "" {
+		user2Name = user2
 	}
 
 	// 1. Поиск существующего direct-диалога между этими двумя участниками
@@ -261,6 +270,13 @@ func (s *Store) GetOrCreateDirectChat(ctx context.Context, user1, user2 string) 
 	`, user1, user2).Scan(&existID)
 
 	if err == nil && existID != uuid.Nil {
+		// Освежаем display_name при наличии актуального имени
+		_, _ = s.pool.Exec(ctx, `
+			UPDATE chat_members SET display_name = $3 WHERE chat_id = $1 AND user_id = $2 AND (display_name = '' OR display_name = user_id)
+		`, existID, user1, user1Name)
+		_, _ = s.pool.Exec(ctx, `
+			UPDATE chat_members SET display_name = $3 WHERE chat_id = $1 AND user_id = $2 AND (display_name = '' OR display_name = user_id)
+		`, existID, user2, user2Name)
 		return s.GetChat(ctx, existID, user1)
 	}
 
@@ -275,7 +291,7 @@ func (s *Store) GetOrCreateDirectChat(ctx context.Context, user1, user2 string) 
 	chat := &Chat{
 		ID:        chatID,
 		Kind:      ChatKindDirect,
-		Title:     user2,
+		Title:     user2Name,
 		CreatedBy: user1,
 	}
 
@@ -283,27 +299,27 @@ func (s *Store) GetOrCreateDirectChat(ctx context.Context, user1, user2 string) 
 		INSERT INTO chats (id, kind, title, description, avatar_url, is_forum, is_archived, created_by, created_at, updated_at)
 		VALUES ($1, 'direct', $2, '', '', FALSE, FALSE, $3, NOW(), NOW())
 		RETURNING created_at, updated_at
-	`, chatID, user2, user1).Scan(&chat.CreatedAt, &chat.UpdatedAt)
+	`, chatID, user2Name, user1).Scan(&chat.CreatedAt, &chat.UpdatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("insert direct chat: %w", err)
 	}
 
-	// Добавляем обоих участников
+	// Добавляем обоих участников с их читаемыми именами (display_name)
 	_, err = tx.Exec(ctx, `
-		INSERT INTO chat_members (chat_id, user_id, role, joined_at)
-		VALUES ($1, $2, 'member', NOW())
-		ON CONFLICT (chat_id, user_id) DO NOTHING
-	`, chatID, user1)
+		INSERT INTO chat_members (chat_id, user_id, display_name, role, joined_at)
+		VALUES ($1, $2, $3, 'member', NOW())
+		ON CONFLICT (chat_id, user_id) DO UPDATE SET display_name = EXCLUDED.display_name
+	`, chatID, user1, user1Name)
 	if err != nil {
 		return nil, fmt.Errorf("add direct member 1: %w", err)
 	}
 
 	if user1 != user2 {
 		_, err = tx.Exec(ctx, `
-			INSERT INTO chat_members (chat_id, user_id, role, joined_at)
-			VALUES ($1, $2, 'member', NOW())
-			ON CONFLICT (chat_id, user_id) DO NOTHING
-		`, chatID, user2)
+			INSERT INTO chat_members (chat_id, user_id, display_name, role, joined_at)
+			VALUES ($1, $2, $3, 'member', NOW())
+			ON CONFLICT (chat_id, user_id) DO UPDATE SET display_name = EXCLUDED.display_name
+		`, chatID, user2, user2Name)
 		if err != nil {
 			return nil, fmt.Errorf("add direct member 2: %w", err)
 		}
@@ -313,7 +329,7 @@ func (s *Store) GetOrCreateDirectChat(ctx context.Context, user1, user2 string) 
 		return nil, fmt.Errorf("commit direct chat: %w", err)
 	}
 
-	return chat, nil
+	return s.GetChat(ctx, chatID, user1)
 }
 
 // ListUserChats возвращает список чатов пользователя с вычисленным количеством непрочитанных сообщений.
@@ -325,6 +341,7 @@ func (s *Store) ListUserChats(ctx context.Context, userID string, groups []strin
 		SELECT c.id, c.kind,
 		       CASE
 		           WHEN c.kind = 'direct' THEN COALESCE(
+		               NULLIF((SELECT cm_peer.display_name FROM chat_members cm_peer WHERE cm_peer.chat_id = c.id AND cm_peer.user_id != $1 LIMIT 1), ''),
 		               NULLIF((SELECT cm_peer.user_id FROM chat_members cm_peer WHERE cm_peer.chat_id = c.id AND cm_peer.user_id != $1 LIMIT 1), ''),
 		               c.title
 		           )

@@ -19,6 +19,7 @@ type startCallReq struct {
 // handleStartCall — POST /api/v1/calls/start
 func (s *Server) handleStartCall(w http.ResponseWriter, r *http.Request) {
 	claims, _ := claimsFromContext(r.Context())
+	userID := getUserID(claims)
 	var req startCallReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
@@ -30,10 +31,15 @@ func (s *Server) handleStartCall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	callerName := claims.ActorName
+	if callerName == "" {
+		callerName = userID
+	}
+
 	call := &store.CallSession{
 		ID:           uuid.New(),
 		ChatID:       req.ChatID,
-		CallerUserID: claims.Subject,
+		CallerUserID: userID,
 		CalleeUserID: req.CalleeUserID,
 		Status:       "ringing",
 	}
@@ -50,8 +56,8 @@ func (s *Server) handleStartCall(w http.ResponseWriter, r *http.Request) {
 		TargetID: req.CalleeUserID,
 		Payload: map[string]any{
 			"call_id":        call.ID.String(),
-			"caller_user_id": claims.Subject,
-			"caller_name":    claims.ActorName,
+			"caller_user_id": userID,
+			"caller_name":    callerName,
 		},
 	})
 

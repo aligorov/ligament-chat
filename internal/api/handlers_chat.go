@@ -43,6 +43,7 @@ type createChatReq struct {
 	AvatarURL      string                  `json:"avatar_url"`
 	IsForum        bool                    `json:"is_forum"`
 	TargetUser     string                  `json:"target_user"`
+	TargetName     string                  `json:"target_name"`
 	Members        []string                `json:"members"`
 	InitialMembers []string                `json:"initial_members"`
 	AccessRules    []store.GroupAccessRule `json:"access_rules"`
@@ -78,7 +79,20 @@ func (s *Server) handleCreateChat(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		chat, err := s.st.GetOrCreateDirectChat(r.Context(), userID, target)
+		targetName := strings.TrimSpace(req.TargetName)
+		if targetName == "" {
+			targetName = req.Title
+		}
+		if targetName == "" {
+			targetName = target
+		}
+
+		actorName := claims.ActorName
+		if actorName == "" {
+			actorName = userID
+		}
+
+		chat, err := s.st.GetOrCreateDirectChat(r.Context(), userID, target, actorName, targetName)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed_to_create_direct_chat"})
 			return

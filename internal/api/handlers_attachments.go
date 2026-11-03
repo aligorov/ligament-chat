@@ -16,6 +16,7 @@ import (
 // handleUploadAttachment — POST /api/v1/attachments/upload
 func (s *Server) handleUploadAttachment(w http.ResponseWriter, r *http.Request) {
 	claims, _ := claimsFromContext(r.Context())
+	userID := getUserID(claims)
 	if err := r.ParseMultipartForm(50 << 20); err != nil { // 50MB max
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "file_too_large_or_invalid_form"})
 		return
@@ -28,7 +29,7 @@ func (s *Server) handleUploadAttachment(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	ok, role, err := s.st.CanAccessChat(r.Context(), chatID, claims.Subject, claims.ADGroups, claims.Department, claims.Role)
+	ok, role, err := s.st.CanAccessChat(r.Context(), chatID, userID, claims.ADGroups, claims.Department, claims.Role)
 	if err != nil || !ok || role == "viewer" {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "upload_not_allowed"})
 		return
@@ -104,7 +105,8 @@ func (s *Server) handleDownloadAttachment(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	ok, _, err := s.st.CanAccessChat(r.Context(), att.ChatID, claims.Subject, claims.ADGroups, claims.Department, claims.Role)
+	userID := getUserID(claims)
+	ok, _, err := s.st.CanAccessChat(r.Context(), att.ChatID, userID, claims.ADGroups, claims.Department, claims.Role)
 	if err != nil || !ok {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "access_denied"})
 		return
