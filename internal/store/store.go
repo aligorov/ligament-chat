@@ -791,6 +791,89 @@ func (s *Store) RemoveChatMember(ctx context.Context, chatID uuid.UUID, userID s
 	return err
 }
 
+// ListMissedMessagesForUser возвращает список пропущенных сообщений с id > sinceID для чатов пользователя
+func (s *Store) ListMissedMessagesForUser(ctx context.Context, userID string, groups []string, dept, role string, sinceID int64, limit int) ([]Message, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 200
+	}
+	isAdmin := role == "chat_admin" || role == "admin" || role == "superadmin"
+
+	query := `
+		SELECT m.id, m.chat_id, m.topic_id, m.sender_id, m.sender_name, m.client_msg_id, m.reply_to_id, m.body, m.kind, m.secret_ttl_seconds, m.secret_read_at, m.metadata, m.created_at, m.edited_at, m.deleted_at
+		FROM messages m
+		JOIN chats c ON c.id = m.chat_id
+		WHERE m.id > $1
+		  AND m.deleted_at IS NULL
+		  AND c.is_archived = FALSE
+		  AND (
+		      $3 = TRUE
+		      OR EXISTS (SELECT 1 FROM chat_members cm WHERE cm.chat_id = c.id AND cm.user_id = $2)
+		      OR EXISTS (
+		          SELECT 1 FROM group_access_rules gar
+		          WHERE gar.chat_id = c.id AND (
+		              (gar.rule_type = 'ad_group' AND gar.target_name = ANY($4))
+		              OR (gar.rule_type = 'department' AND gar.target_name = $5)
+		              OR (gar.rule_type = 'user' AND gar.target_name = $2)
+		          )
+		      )
+		  )
+		ORDER BY m.id ASC
+		LIMIT $6
+	`
+
+	rows, err := s.pool.Query(ctx, query, sinceID, userID, isAdmin, groups, dept, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var msgs []Message
+	var msgIDs []int64
+	for rows.Next() {
+		var m Message
+		var metaRaw []byte
+		if err := rows.Scan(&m.ID, &m.ChatID, &m.TopicID, &m.SenderID, &m.SenderName, &m.ClientMsgID, &m.ReplyToID, &m.Body, &m.Kind, &m.SecretTTLSeconds, &m.SecretReadAt, &metaRaw, &m.CreatedAt, &m.EditedAt, &m.DeletedAt); err != nil {
+			return nil, err
+		}
+		if len(metaRaw) > 0 {
+			_ = json.Unmarshal(metaRaw, &m.Metadata)
+		}
+		msgs = append(msgs, m)
+		msgIDs = append(msgIDs, m.ID)
+	}
+
+	if len(msgIDs) > 0 {
+		attRows, aErr := s.pool.Query(ctx, `
+			SELECT id, message_id, chat_id, file_name, file_size, content_type, storage_path, sha256_hex, created_at
+			FROM attachments
+			WHERE message_id = ANY($1)
+		`, msgIDs)
+		if aErr == nil {
+			defer attRows.Close()
+			attsByMsg := make(map[int64][]Attachment)
+			for attRows.Next() {
+				var a Attachment
+				if err := attRows.Scan(&a.ID, &a.MessageID, &a.ChatID, &a.FileName, &a.FileSize, &a.ContentType, &a.StoragePath, &a.SHA256Hex, &a.CreatedAt); err == nil {
+					attsByMsg[a.MessageID] = append(attsByMsg[a.MessageID], a)
+				}
+			}
+			for i := range msgs {
+				if attList, ok := attsByMsg[msgs[i].ID]; ok {
+					if msgs[i].Metadata == nil {
+						msgs[i].Metadata = make(map[string]any)
+					}
+					msgs[i].Metadata["attachments"] = attList
+				}
+			}
+		}
+	}
+
+	if msgs == nil {
+		msgs = []Message{}
+	}
+	return msgs, rows.Err()
+}
+
 func IsUniqueViolation(err error) bool {
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {

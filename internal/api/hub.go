@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -350,6 +351,13 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var lastMsgID int64
+	if sID := r.URL.Query().Get("last_message_id"); sID != "" {
+		if val, err := strconv.ParseInt(sID, 10, 64); err == nil && val > 0 {
+			lastMsgID = val
+		}
+	}
+
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		slog.Error("ws.upgrade_failed", "err", err)
@@ -358,16 +366,47 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 
 	userID := getUserID(claims)
 	client := &Client{
-		hub:     s.hub,
-		st:      s.st,
-		claims:  claims,
-		conn:    conn,
-		userID:  userID,
-		send:    make(chan []byte, 256),
-		rooms:   make(map[string]bool),
+		hub:    s.hub,
+		st:     s.st,
+		claims: claims,
+		conn:   conn,
+		userID: userID,
+		send:   make(chan []byte, 256),
+		rooms:  make(map[string]bool),
 	}
 
 	s.hub.register <- client
+
+	// Если передан last_message_id, досылаем пропущенные клиентом сообщения
+	if lastMsgID > 0 {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			missed, err := s.st.ListMissedMessagesForUser(ctx, userID, claims.ADGroups, claims.Department, claims.Role, lastMsgID, 200)
+			if err != nil {
+				slog.Error("ws.gap_sync_failed", "user_id", userID, "since_id", lastMsgID, "err", err)
+				return
+			}
+			for _, m := range missed {
+				b, err := json.Marshal(map[string]any{
+					"type": "chat.message",
+					"payload": map[string]any{
+						"message":  m,
+						"gap_sync": true,
+					},
+				})
+				if err != nil {
+					continue
+				}
+				select {
+				case client.send <- b:
+				case <-time.After(500 * time.Millisecond):
+					return
+				}
+			}
+		}()
+	}
 
 	go client.writePump()
 	go client.readPump()
