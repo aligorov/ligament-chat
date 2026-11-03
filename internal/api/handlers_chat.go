@@ -355,6 +355,7 @@ type sendMessageReq struct {
 	SecretTTLSeconds *int           `json:"secret_ttl_seconds"`
 	Metadata         map[string]any `json:"metadata"`
 	AttachmentIDs    []string       `json:"attachment_ids"`
+	Attachments      []string       `json:"attachments"`
 }
 
 // handleSendMessage — POST /api/v1/chats/{id}/messages
@@ -384,9 +385,14 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Извлекаем вложения из attachment_ids или metadata
+	// Извлекаем вложения из attachment_ids, attachments или metadata
 	var parsedAttIDs []uuid.UUID
 	for _, idStr := range req.AttachmentIDs {
+		if id, err := uuid.Parse(idStr); err == nil {
+			parsedAttIDs = append(parsedAttIDs, id)
+		}
+	}
+	for _, idStr := range req.Attachments {
 		if id, err := uuid.Parse(idStr); err == nil {
 			parsedAttIDs = append(parsedAttIDs, id)
 		}

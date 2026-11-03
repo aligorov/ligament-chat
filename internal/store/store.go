@@ -581,7 +581,9 @@ func (s *Store) ListMessages(ctx context.Context, chatID uuid.UUID, topicID int6
 			for attRows.Next() {
 				var a Attachment
 				if scanErr := attRows.Scan(&a.ID, &a.MessageID, &a.ChatID, &a.FileName, &a.FileSize, &a.ContentType, &a.StoragePath, &a.SHA256Hex, &a.CreatedAt); scanErr == nil {
-					attsByMsg[a.MessageID] = append(attsByMsg[a.MessageID], a)
+					if a.MessageID != nil {
+						attsByMsg[*a.MessageID] = append(attsByMsg[*a.MessageID], a)
+					}
 				}
 			}
 			for i := range msgs {
@@ -854,7 +856,9 @@ func (s *Store) ListMissedMessagesForUser(ctx context.Context, userID string, gr
 			for attRows.Next() {
 				var a Attachment
 				if err := attRows.Scan(&a.ID, &a.MessageID, &a.ChatID, &a.FileName, &a.FileSize, &a.ContentType, &a.StoragePath, &a.SHA256Hex, &a.CreatedAt); err == nil {
-					attsByMsg[a.MessageID] = append(attsByMsg[a.MessageID], a)
+					if a.MessageID != nil {
+						attsByMsg[*a.MessageID] = append(attsByMsg[*a.MessageID], a)
+					}
 				}
 			}
 			for i := range msgs {

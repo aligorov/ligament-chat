@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -46,6 +47,7 @@ func (s *Server) handleUploadAttachment(w http.ResponseWriter, r *http.Request) 
 	ext := filepath.Ext(header.Filename)
 	saveDir := filepath.Join(s.dataDir, "attachments", chatID.String())
 	if err := os.MkdirAll(saveDir, 0755); err != nil {
+		slog.Error("chat: attachments mkdir failed", "err", err, "dir", saveDir)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed_to_create_storage_dir"})
 		return
 	}
@@ -53,6 +55,7 @@ func (s *Server) handleUploadAttachment(w http.ResponseWriter, r *http.Request) 
 	storagePath := filepath.Join(saveDir, attID.String()+ext)
 	dst, err := os.Create(storagePath)
 	if err != nil {
+		slog.Error("chat: attachments file create failed", "err", err, "path", storagePath)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed_to_save_file"})
 		return
 	}
@@ -62,6 +65,7 @@ func (s *Server) handleUploadAttachment(w http.ResponseWriter, r *http.Request) 
 	writer := io.MultiWriter(dst, hasher)
 	size, err := io.Copy(writer, file)
 	if err != nil {
+		slog.Error("chat: attachments write file failed", "err", err, "path", storagePath)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed_to_write_file"})
 		return
 	}
@@ -82,6 +86,7 @@ func (s *Server) handleUploadAttachment(w http.ResponseWriter, r *http.Request) 
 	}
 
 	if err := s.st.SaveAttachment(r.Context(), att); err != nil {
+		slog.Error("chat: attachments save meta failed", "err", err, "att_id", attID, "chat_id", chatID)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed_to_save_attachment_meta"})
 		return
 	}

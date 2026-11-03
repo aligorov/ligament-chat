@@ -94,7 +94,7 @@ type Message struct {
 // Attachment представляет вложенный файл
 type Attachment struct {
 	ID          uuid.UUID `json:"id"`
-	MessageID   int64     `json:"message_id"`
+	MessageID   *int64    `json:"message_id,omitempty"`
 	ChatID      uuid.UUID `json:"chat_id"`
 	FileName    string    `json:"file_name"`
 	FileSize    int64     `json:"file_size"`
