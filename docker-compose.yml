@@ -25,7 +25,7 @@ services:
       retries: 20
 
   chat:
-    image: aligorov/ligament_chat:v0.1.0
+    image: aligorov/ligament_chat:latest
     build: .
     container_name: ligament-chat
     restart: unless-stopped
