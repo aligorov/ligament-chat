@@ -270,6 +270,23 @@ func (c *Client) readPump() {
 					Payload: map[string]any{"user_id": c.userID},
 				})
 			}
+		case "call.invite", "call.answered", "call.hangup", "call.rejected":
+			// Сигналинг состояния вызова
+			if msg.TargetID != "" {
+				c.hub.SendDirect(msg.TargetID, HubMessage{
+					Type:     msg.Type,
+					ChatID:   msg.ChatID,
+					TargetID: c.userID,
+					Payload:  msg.Payload,
+				})
+			} else if msg.ChatID != "" {
+				c.hub.BroadcastToRoom("chat:"+msg.ChatID, HubMessage{
+					Type:     msg.Type,
+					ChatID:   msg.ChatID,
+					TargetID: c.userID,
+					Payload:  msg.Payload,
+				})
+			}
 		case "webrtc.signal":
 			// Сигналинг WebRTC (SDP offer/answer, ICE candidate)
 			if msg.TargetID != "" {

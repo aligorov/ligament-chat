@@ -290,6 +290,14 @@ func (s *Server) handleCreateTopic(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Транслируем создание темы всем участникам в WebSocket-комнату чата
+	s.hub.BroadcastToRoom("chat:"+chatID.String(), HubMessage{
+		Type:    "chat.topic_created",
+		ChatID:  chatID.String(),
+		TopicID: topic.ID,
+		Payload: map[string]any{"topic": topic},
+	})
+
 	writeJSON(w, http.StatusCreated, topic)
 }
 
@@ -346,6 +354,7 @@ type sendMessageReq struct {
 	Kind             string         `json:"kind"`
 	SecretTTLSeconds *int           `json:"secret_ttl_seconds"`
 	Metadata         map[string]any `json:"metadata"`
+	AttachmentIDs    []string       `json:"attachment_ids"`
 }
 
 // handleSendMessage — POST /api/v1/chats/{id}/messages
@@ -364,7 +373,7 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "access_denied"})
 		return
 	}
-	if role == "viewer" {
+	if role == "viewer" || role == store.MemberRoleReadOnly {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "read_only_mode"})
 		return
 	}
@@ -375,13 +384,46 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Извлекаем вложения из attachment_ids или metadata
+	var parsedAttIDs []uuid.UUID
+	for _, idStr := range req.AttachmentIDs {
+		if id, err := uuid.Parse(idStr); err == nil {
+			parsedAttIDs = append(parsedAttIDs, id)
+		}
+	}
+	if req.Metadata != nil {
+		if rawAtts, ok := req.Metadata["attachments"].([]any); ok {
+			for _, a := range rawAtts {
+				if aMap, ok := a.(map[string]any); ok {
+					if idStr, ok := aMap["id"].(string); ok {
+						if id, err := uuid.Parse(idStr); err == nil {
+							parsedAttIDs = append(parsedAttIDs, id)
+						}
+					}
+				}
+			}
+		}
+		if rawAttID, ok := req.Metadata["attachment_id"].(string); ok {
+			if id, err := uuid.Parse(rawAttID); err == nil {
+				parsedAttIDs = append(parsedAttIDs, id)
+			}
+		}
+	}
+
 	req.Body = strings.TrimSpace(req.Body)
-	if req.Body == "" && req.Kind != store.MsgKindLinkCall {
+	if req.Body == "" && len(parsedAttIDs) == 0 && req.Kind != store.MsgKindLinkCall {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "empty_body"})
 		return
 	}
+	if req.Body == "" && len(parsedAttIDs) > 0 {
+		req.Body = "Вложение"
+	}
 	if req.Kind == "" {
-		req.Kind = store.MsgKindText
+		if len(parsedAttIDs) > 0 {
+			req.Kind = "file"
+		} else {
+			req.Kind = store.MsgKindText
+		}
 	}
 	clientMsgID := strings.TrimSpace(req.ClientMsgID)
 	if clientMsgID == "" {
@@ -406,7 +448,7 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 		Metadata:         req.Metadata,
 	}
 
-	if err := s.st.SendMessage(r.Context(), msg); err != nil {
+	if err := s.st.SendMessage(r.Context(), msg, parsedAttIDs); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed_to_send_message"})
 		return
 	}
@@ -462,6 +504,183 @@ func (s *Server) handleReadPointer(w http.ResponseWriter, r *http.Request) {
 		Payload: map[string]any{
 			"user_id":      userID,
 			"last_read_id": req.LastReadID,
+		},
+	})
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// handleListMembers — GET /api/v1/chats/{id}/members
+func (s *Server) handleListMembers(w http.ResponseWriter, r *http.Request) {
+	claims, _ := claimsFromContext(r.Context())
+	userID := getUserID(claims)
+	chatIDStr := r.PathValue("id")
+	chatID, err := uuid.Parse(chatIDStr)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_chat_id"})
+		return
+	}
+
+	ok, _, err := s.st.CanAccessChat(r.Context(), chatID, userID, claims.ADGroups, claims.Department, claims.Role)
+	if err != nil || !ok {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "access_denied"})
+		return
+	}
+
+	members, err := s.st.ListChatMembers(r.Context(), chatID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed_to_list_members"})
+		return
+	}
+	writeJSON(w, http.StatusOK, members)
+}
+
+type addMemberReq struct {
+	UserID      string `json:"user_id"`
+	DisplayName string `json:"display_name"`
+	Role        string `json:"role"` // admin, moderator, member, read_only
+}
+
+// handleAddMember — POST /api/v1/chats/{id}/members
+func (s *Server) handleAddMember(w http.ResponseWriter, r *http.Request) {
+	claims, _ := claimsFromContext(r.Context())
+	userID := getUserID(claims)
+	chatIDStr := r.PathValue("id")
+	chatID, err := uuid.Parse(chatIDStr)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_chat_id"})
+		return
+	}
+
+	ok, myRole, err := s.st.CanAccessChat(r.Context(), chatID, userID, claims.ADGroups, claims.Department, claims.Role)
+	if err != nil || !ok || (myRole != store.MemberRoleAdmin && myRole != store.MemberRoleModerator) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "admin_or_moderator_required"})
+		return
+	}
+
+	var req addMemberReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
+		return
+	}
+	req.UserID = strings.TrimSpace(req.UserID)
+	if req.UserID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "empty_user_id"})
+		return
+	}
+	if req.Role == "" {
+		req.Role = store.MemberRoleMember
+	}
+
+	if err := s.st.AddOrUpdateChatMember(r.Context(), chatID, req.UserID, req.DisplayName, req.Role); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed_to_add_member"})
+		return
+	}
+
+	event := HubMessage{
+		Type:   "chat.member_added",
+		ChatID: chatID.String(),
+		Payload: map[string]any{
+			"user_id":      req.UserID,
+			"display_name": req.DisplayName,
+			"role":         req.Role,
+		},
+	}
+	s.hub.BroadcastToRoom("chat:"+chatID.String(), event)
+	s.hub.SendDirect(req.UserID, event)
+
+	writeJSON(w, http.StatusCreated, map[string]string{"status": "ok"})
+}
+
+type updateMemberReq struct {
+	Role        string `json:"role"`
+	DisplayName string `json:"display_name"`
+}
+
+// handleUpdateMember — PUT /api/v1/chats/{id}/members/{user_id}
+func (s *Server) handleUpdateMember(w http.ResponseWriter, r *http.Request) {
+	claims, _ := claimsFromContext(r.Context())
+	userID := getUserID(claims)
+	chatIDStr := r.PathValue("id")
+	chatID, err := uuid.Parse(chatIDStr)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_chat_id"})
+		return
+	}
+	targetUserID := r.PathValue("user_id")
+	if targetUserID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "empty_user_id"})
+		return
+	}
+
+	ok, myRole, err := s.st.CanAccessChat(r.Context(), chatID, userID, claims.ADGroups, claims.Department, claims.Role)
+	if err != nil || !ok || myRole != store.MemberRoleAdmin {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "admin_required"})
+		return
+	}
+
+	var req updateMemberReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
+		return
+	}
+	if req.Role == "" {
+		req.Role = store.MemberRoleMember
+	}
+
+	if err := s.st.AddOrUpdateChatMember(r.Context(), chatID, targetUserID, req.DisplayName, req.Role); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed_to_update_member"})
+		return
+	}
+
+	s.hub.BroadcastToRoom("chat:"+chatID.String(), HubMessage{
+		Type:   "chat.member_updated",
+		ChatID: chatID.String(),
+		Payload: map[string]any{
+			"user_id": targetUserID,
+			"role":    req.Role,
+		},
+	})
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// handleRemoveMember — DELETE /api/v1/chats/{id}/members/{user_id}
+func (s *Server) handleRemoveMember(w http.ResponseWriter, r *http.Request) {
+	claims, _ := claimsFromContext(r.Context())
+	userID := getUserID(claims)
+	chatIDStr := r.PathValue("id")
+	chatID, err := uuid.Parse(chatIDStr)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_chat_id"})
+		return
+	}
+	targetUserID := r.PathValue("user_id")
+	if targetUserID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "empty_user_id"})
+		return
+	}
+
+	ok, myRole, err := s.st.CanAccessChat(r.Context(), chatID, userID, claims.ADGroups, claims.Department, claims.Role)
+	if err != nil || !ok {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "access_denied"})
+		return
+	}
+	if myRole != store.MemberRoleAdmin && userID != targetUserID {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "admin_required"})
+		return
+	}
+
+	if err := s.st.RemoveChatMember(r.Context(), chatID, targetUserID); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed_to_remove_member"})
+		return
+	}
+
+	s.hub.BroadcastToRoom("chat:"+chatID.String(), HubMessage{
+		Type:   "chat.member_removed",
+		ChatID: chatID.String(),
+		Payload: map[string]any{
+			"user_id": targetUserID,
 		},
 	})
 

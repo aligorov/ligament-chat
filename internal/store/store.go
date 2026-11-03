@@ -457,7 +457,8 @@ func (s *Store) ListChatTopics(ctx context.Context, chatID uuid.UUID, userID str
 }
 
 // SendMessage сохраняет сообщение в чат с монотонным ID и поддержкой идемпотентности.
-func (s *Store) SendMessage(ctx context.Context, msg *Message) error {
+// SendMessage сохраняет сообщение в чат с монотонным ID, поддержкой идемпотентности и привязкой вложений.
+func (s *Store) SendMessage(ctx context.Context, msg *Message, attachmentIDs []uuid.UUID) error {
 	metaJSON, err := json.Marshal(msg.Metadata)
 	if err != nil {
 		metaJSON = []byte("{}")
@@ -475,6 +476,29 @@ func (s *Store) SendMessage(ctx context.Context, msg *Message) error {
 		return fmt.Errorf("store: insert message: %w", err)
 	}
 
+	// Привязываем вложения к созданному сообщению
+	if len(attachmentIDs) > 0 {
+		_, _ = s.pool.Exec(ctx, `
+			UPDATE attachments
+			SET message_id = $1
+			WHERE id = ANY($2) AND chat_id = $3
+		`, msg.ID, attachmentIDs, msg.ChatID)
+
+		attRows, aErr := s.pool.Query(ctx, `
+			SELECT id, message_id, chat_id, file_name, file_size, content_type, storage_path, sha256_hex, created_at
+			FROM attachments WHERE message_id = $1
+		`, msg.ID)
+		if aErr == nil {
+			defer attRows.Close()
+			for attRows.Next() {
+				var a Attachment
+				if scanErr := attRows.Scan(&a.ID, &a.MessageID, &a.ChatID, &a.FileName, &a.FileSize, &a.ContentType, &a.StoragePath, &a.SHA256Hex, &a.CreatedAt); scanErr == nil {
+					msg.Attachments = append(msg.Attachments, a)
+				}
+			}
+		}
+	}
+
 	// Обновляем updated_at у чата и топика
 	_, _ = s.pool.Exec(ctx, `UPDATE chats SET updated_at = NOW() WHERE id = $1`, msg.ChatID)
 	if msg.TopicID > 0 {
@@ -484,7 +508,7 @@ func (s *Store) SendMessage(ctx context.Context, msg *Message) error {
 	return nil
 }
 
-// ListMessages возвращает сообщения чата/топика до указанного beforeID (пагинация назад) или последние.
+// ListMessages возвращает сообщения чата/топика до указанного beforeID (пагинация назад) или последние, включая вложения.
 func (s *Store) ListMessages(ctx context.Context, chatID uuid.UUID, topicID int64, beforeID int64, limit int) ([]Message, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 50
@@ -516,6 +540,7 @@ func (s *Store) ListMessages(ctx context.Context, chatID uuid.UUID, topicID int6
 	defer rows.Close()
 
 	var msgs []Message
+	var msgIDs []int64
 	for rows.Next() {
 		var m Message
 		var metaRaw []byte
@@ -526,6 +551,31 @@ func (s *Store) ListMessages(ctx context.Context, chatID uuid.UUID, topicID int6
 			_ = json.Unmarshal(metaRaw, &m.Metadata)
 		}
 		msgs = append(msgs, m)
+		msgIDs = append(msgIDs, m.ID)
+	}
+
+	// Загружаем вложения для всех выбранных сообщений
+	if len(msgIDs) > 0 {
+		attRows, aErr := s.pool.Query(ctx, `
+			SELECT id, message_id, chat_id, file_name, file_size, content_type, storage_path, sha256_hex, created_at
+			FROM attachments
+			WHERE chat_id = $1 AND message_id = ANY($2)
+		`, chatID, msgIDs)
+		if aErr == nil {
+			defer attRows.Close()
+			attsByMsg := make(map[int64][]Attachment)
+			for attRows.Next() {
+				var a Attachment
+				if scanErr := attRows.Scan(&a.ID, &a.MessageID, &a.ChatID, &a.FileName, &a.FileSize, &a.ContentType, &a.StoragePath, &a.SHA256Hex, &a.CreatedAt); scanErr == nil {
+					attsByMsg[a.MessageID] = append(attsByMsg[a.MessageID], a)
+				}
+			}
+			for i := range msgs {
+				if atts, ok := attsByMsg[msgs[i].ID]; ok {
+					msgs[i].Attachments = atts
+				}
+			}
+		}
 	}
 
 	// Разворачиваем в хронологический порядок (id ASC)
@@ -673,6 +723,57 @@ func (s *Store) SetSetting(ctx context.Context, key string, val any) error {
 		ON CONFLICT (key) DO UPDATE
 		SET value = EXCLUDED.value, updated_at = NOW()
 	`, key, raw)
+	return err
+}
+
+// ListChatMembers возвращает список всех участников чата с ролями
+func (s *Store) ListChatMembers(ctx context.Context, chatID uuid.UUID) ([]ChatMember, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT chat_id, user_id, COALESCE(display_name, ''), role, joined_at
+		FROM chat_members
+		WHERE chat_id = $1
+		ORDER BY role = 'admin' DESC, role = 'moderator' DESC, joined_at ASC
+	`, chatID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var members []ChatMember
+	for rows.Next() {
+		var m ChatMember
+		if err := rows.Scan(&m.ChatID, &m.UserID, &m.DisplayName, &m.Role, &m.JoinedAt); err != nil {
+			return nil, err
+		}
+		members = append(members, m)
+	}
+	if members == nil {
+		members = []ChatMember{}
+	}
+	return members, rows.Err()
+}
+
+// AddOrUpdateChatMember добавляет участника или обновляет его роль и отображаемое имя
+func (s *Store) AddOrUpdateChatMember(ctx context.Context, chatID uuid.UUID, userID, displayName, role string) error {
+	if role == "" {
+		role = MemberRoleMember
+	}
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO chat_members (chat_id, user_id, display_name, role, joined_at)
+		VALUES ($1, $2, $3, $4, NOW())
+		ON CONFLICT (chat_id, user_id) DO UPDATE
+		SET role = EXCLUDED.role,
+		    display_name = CASE WHEN EXCLUDED.display_name <> '' THEN EXCLUDED.display_name ELSE chat_members.display_name END
+	`, chatID, userID, displayName, role)
+	return err
+}
+
+// RemoveChatMember удаляет участника из чата
+func (s *Store) RemoveChatMember(ctx context.Context, chatID uuid.UUID, userID string) error {
+	_, err := s.pool.Exec(ctx, `
+		DELETE FROM chat_members
+		WHERE chat_id = $1 AND user_id = $2
+	`, chatID, userID)
 	return err
 }
 

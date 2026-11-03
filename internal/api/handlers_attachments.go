@@ -120,6 +120,8 @@ func (s *Server) handleDownloadAttachment(w http.ResponseWriter, r *http.Request
 	defer f.Close()
 
 	w.Header().Set("Content-Type", att.ContentType)
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Cache-Control", "public, max-age=86400")
 	if strings.HasPrefix(att.ContentType, "image/") || strings.HasPrefix(att.ContentType, "video/") || att.ContentType == "application/pdf" {
 		w.Header().Set("Content-Disposition", "inline; filename=\""+att.FileName+"\"")
 	} else {

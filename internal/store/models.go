@@ -11,7 +11,17 @@ const (
 	MemberRoleAdmin     = "admin"
 	MemberRoleModerator = "moderator"
 	MemberRoleMember    = "member"
+	MemberRoleReadOnly  = "read_only"
 )
+
+// ChatMember представляет участника чата с ролью
+type ChatMember struct {
+	ChatID      uuid.UUID `json:"chat_id"`
+	UserID      string    `json:"user_id"`
+	DisplayName string    `json:"display_name"`
+	Role        string    `json:"role"`
+	JoinedAt    time.Time `json:"joined_at"`
+}
 
 // Типы чатов
 const (
