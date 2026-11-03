@@ -53,6 +53,7 @@ type Chat struct {
 	CreatedAt   time.Time `json:"created_at"`
 	UpdatedAt   time.Time `json:"updated_at"`
 	UnreadCount int       `json:"unread_count"`
+	PeerUserID  string    `json:"peer_user_id,omitempty"`
 }
 
 // ChatTopic представляет топик (тему) в форуме

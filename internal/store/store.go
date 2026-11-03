@@ -384,7 +384,8 @@ func (s *Store) ListUserChats(ctx context.Context, userID string, groups []strin
 		           FROM messages m
 		           LEFT JOIN topic_participants tp ON tp.chat_id = m.chat_id AND tp.topic_id = m.topic_id AND tp.user_id = $1
 		           WHERE m.chat_id = c.id AND m.id > COALESCE(tp.last_read_message_id, 0)
-		       ), 0) AS unread_count
+		       ), 0) AS unread_count,
+		       COALESCE((SELECT cm_peer.user_id FROM chat_members cm_peer WHERE cm_peer.chat_id = c.id AND cm_peer.user_id != $1 LIMIT 1), '') AS peer_user_id
 		FROM chats c
 		WHERE c.is_archived = FALSE AND (
 		    $2 = TRUE
@@ -410,7 +411,7 @@ func (s *Store) ListUserChats(ctx context.Context, userID string, groups []strin
 	var chats []Chat
 	for rows.Next() {
 		var c Chat
-		if err := rows.Scan(&c.ID, &c.Kind, &c.Title, &c.Description, &c.AvatarURL, &c.IsForum, &c.IsArchived, &c.CreatedBy, &c.CreatedAt, &c.UpdatedAt, &c.UnreadCount); err != nil {
+		if err := rows.Scan(&c.ID, &c.Kind, &c.Title, &c.Description, &c.AvatarURL, &c.IsForum, &c.IsArchived, &c.CreatedBy, &c.CreatedAt, &c.UpdatedAt, &c.UnreadCount, &c.PeerUserID); err != nil {
 			return nil, err
 		}
 		chats = append(chats, c)
