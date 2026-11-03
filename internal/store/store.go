@@ -229,9 +229,10 @@ func (s *Store) GetChat(ctx context.Context, chatID uuid.UUID, forUserID string)
 		           )
 		           ELSE c.title
 		       END AS title,
-		       c.description, c.avatar_url, c.is_forum, c.is_archived, c.created_by, c.created_at, c.updated_at
+		       c.description, c.avatar_url, c.is_forum, c.is_archived, c.created_by, c.created_at, c.updated_at,
+		       COALESCE((SELECT cm_peer.user_id FROM chat_members cm_peer WHERE cm_peer.chat_id = c.id AND cm_peer.user_id != $2 LIMIT 1), '') AS peer_user_id
 		FROM chats c WHERE c.id = $1
-	`, chatID, forUserID).Scan(&c.ID, &c.Kind, &c.Title, &c.Description, &c.AvatarURL, &c.IsForum, &c.IsArchived, &c.CreatedBy, &c.CreatedAt, &c.UpdatedAt)
+	`, chatID, forUserID).Scan(&c.ID, &c.Kind, &c.Title, &c.Description, &c.AvatarURL, &c.IsForum, &c.IsArchived, &c.CreatedBy, &c.CreatedAt, &c.UpdatedAt, &c.PeerUserID)
 	if err != nil {
 		return nil, err
 	}
