@@ -1,0 +1,55 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ligament-chat-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: chat
+      POSTGRES_DB: ligament_chat
+      POSTGRES_HOST_AUTH_METHOD: trust
+    command:
+      - "postgres"
+      - "-c"
+      - "listen_addresses="
+      - "-c"
+      - "unix_socket_directories=/var/run/postgresql"
+      - "-c"
+      - "unix_socket_permissions=0777"
+    volumes:
+      - chat_pgdata:/var/lib/postgresql/data
+      - chat_pgsocket:/var/run/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h /var/run/postgresql -U chat -d ligament_chat"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  chat:
+    image: aligorov/ligament_chat:v0.1.0
+    build: .
+    container_name: ligament-chat
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8097:8097"
+    volumes:
+      - chat_data:/var/lib/ligament-chat
+      - chat_pgsocket:/var/run/postgresql
+    command:
+      - "-listen"
+      - "0.0.0.0:8097"
+      - "-data-dir"
+      - "/var/lib/ligament-chat"
+      - "-db-socket"
+      - "/var/run/postgresql"
+      - "-db-user"
+      - "chat"
+      - "-db-name"
+      - "ligament_chat"
+
+volumes:
+  chat_pgdata:
+  chat_pgsocket:
+  chat_data:

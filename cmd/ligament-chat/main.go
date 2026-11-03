@@ -43,7 +43,13 @@ func main() {
 
 	connStr := *dbConnStr
 	if connStr == "" {
-		connStr = fmt.Sprintf("postgres://%s@/%s?host=%s", *dbUser, *dbName, *dbSocket)
+		if envDSN := os.Getenv("CHAT_DB_DSN"); envDSN != "" {
+			connStr = envDSN
+		} else if envDB := os.Getenv("DATABASE_URL"); envDB != "" {
+			connStr = envDB
+		} else {
+			connStr = fmt.Sprintf("postgres://%s@/%s?host=%s", *dbUser, *dbName, *dbSocket)
+		}
 	}
 
 	st := store.NewStore()

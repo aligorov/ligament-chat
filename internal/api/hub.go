@@ -1,12 +1,16 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
 	"sync"
 	"time"
 
+	"github.com/aligorov/ligament-chat/internal/contract"
+	"github.com/aligorov/ligament-chat/internal/store"
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 )
 
@@ -36,6 +40,8 @@ type HubMessage struct {
 
 type Client struct {
 	hub      *Hub
+	st       *store.Store
+	claims   *contract.ChatClaims
 	conn     *websocket.Conn
 	userID   string
 	send     chan []byte
@@ -204,6 +210,23 @@ func (c *Client) readPump() {
 		switch msg.Type {
 		case "room.join":
 			if msg.ChatID != "" {
+				chatID, err := uuid.Parse(msg.ChatID)
+				if err == nil && c.st != nil {
+					var groups []string
+					var dept, role string
+					if c.claims != nil {
+						groups = c.claims.ADGroups
+						dept = c.claims.Department
+						role = c.claims.Role
+					}
+					// Авторизация подписки: проверяем право доступа к чату перед добавлением в комнату WS
+					ok, _, aErr := c.st.CanAccessChat(context.Background(), chatID, c.userID, groups, dept, role)
+					if aErr != nil || !ok {
+						slog.Warn("ws.room_join_denied", "chat_id", msg.ChatID, "user_id", c.userID)
+						continue
+					}
+				}
+
 				roomKey := "chat:" + msg.ChatID
 				c.roomsMu.Lock()
 				c.rooms[roomKey] = true
@@ -310,6 +333,8 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 
 	client := &Client{
 		hub:     s.hub,
+		st:      s.st,
+		claims:  claims,
 		conn:    conn,
 		userID:  claims.Subject,
 		send:    make(chan []byte, 256),
