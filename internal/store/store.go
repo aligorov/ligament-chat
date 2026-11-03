@@ -270,13 +270,17 @@ func (s *Store) GetOrCreateDirectChat(ctx context.Context, user1, user2, user1Na
 	`, user1, user2).Scan(&existID)
 
 	if err == nil && existID != uuid.Nil {
-		// Освежаем display_name при наличии актуального имени
-		_, _ = s.pool.Exec(ctx, `
-			UPDATE chat_members SET display_name = $3 WHERE chat_id = $1 AND user_id = $2 AND (display_name = '' OR display_name = user_id)
-		`, existID, user1, user1Name)
-		_, _ = s.pool.Exec(ctx, `
-			UPDATE chat_members SET display_name = $3 WHERE chat_id = $1 AND user_id = $2 AND (display_name = '' OR display_name = user_id)
-		`, existID, user2, user2Name)
+		// Освежаем display_name участников при наличии актуальных имен
+		if user1Name != "" && user1Name != user1 {
+			_, _ = s.pool.Exec(ctx, `
+				UPDATE chat_members SET display_name = $3 WHERE chat_id = $1 AND user_id = $2
+			`, existID, user1, user1Name)
+		}
+		if user2Name != "" && user2Name != user2 {
+			_, _ = s.pool.Exec(ctx, `
+				UPDATE chat_members SET display_name = $3 WHERE chat_id = $1 AND user_id = $2
+			`, existID, user2, user2Name)
+		}
 		return s.GetChat(ctx, existID, user1)
 	}
 
@@ -497,6 +501,15 @@ func (s *Store) SendMessage(ctx context.Context, msg *Message, attachmentIDs []u
 				}
 			}
 		}
+	}
+
+	// При наличии читаемого имени отправителя обновляем display_name в участниках чата
+	if msg.SenderName != "" && msg.SenderName != msg.SenderID {
+		_, _ = s.pool.Exec(ctx, `
+			UPDATE chat_members
+			SET display_name = $3
+			WHERE chat_id = $1 AND user_id = $2 AND (display_name = '' OR display_name = user_id)
+		`, msg.ChatID, msg.SenderID, msg.SenderName)
 	}
 
 	// Обновляем updated_at у чата и топика
