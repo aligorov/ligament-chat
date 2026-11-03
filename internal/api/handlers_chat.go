@@ -180,6 +180,30 @@ func (s *Server) handleGetChat(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, chat)
 }
 
+// handleDeleteChat — DELETE /api/v1/chats/{id}
+func (s *Server) handleDeleteChat(w http.ResponseWriter, r *http.Request) {
+	claims, _ := claimsFromContext(r.Context())
+	chatIDStr := r.PathValue("id")
+	chatID, err := uuid.Parse(chatIDStr)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_chat_id"})
+		return
+	}
+
+	userID := getUserID(claims)
+	isAdmin := claims.Role == "admin" || claims.Role == "superadmin" || claims.Role == "chat_admin"
+	if err := s.st.DeleteChat(r.Context(), chatID, userID, isAdmin); err != nil {
+		if strings.HasPrefix(err.Error(), "forbidden") {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed_to_delete_chat"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
 // handleListTopics — GET /api/v1/chats/{id}/topics
 func (s *Server) handleListTopics(w http.ResponseWriter, r *http.Request) {
 	claims, _ := claimsFromContext(r.Context())

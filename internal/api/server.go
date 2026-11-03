@@ -49,6 +49,7 @@ func (s *Server) routes() {
 	s.mux.Handle("GET /api/v1/chats", s.authMiddleware(http.HandlerFunc(s.handleListChats)))
 	s.mux.Handle("POST /api/v1/chats", s.authMiddleware(http.HandlerFunc(s.handleCreateChat)))
 	s.mux.Handle("GET /api/v1/chats/{id}", s.authMiddleware(http.HandlerFunc(s.handleGetChat)))
+	s.mux.Handle("DELETE /api/v1/chats/{id}", s.authMiddleware(http.HandlerFunc(s.handleDeleteChat)))
 	s.mux.Handle("GET /api/v1/chats/{id}/topics", s.authMiddleware(http.HandlerFunc(s.handleListTopics)))
 	s.mux.Handle("POST /api/v1/chats/{id}/topics", s.authMiddleware(http.HandlerFunc(s.handleCreateTopic)))
 	s.mux.Handle("GET /api/v1/chats/{id}/messages", s.authMiddleware(http.HandlerFunc(s.handleListMessages)))

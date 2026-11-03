@@ -332,6 +332,33 @@ func (s *Store) GetOrCreateDirectChat(ctx context.Context, user1, user2, user1Na
 	return s.GetChat(ctx, chatID, user1)
 }
 
+// DeleteChat удаляет чат и все связанные каскадные сущности (сообщения, топики, вложения).
+func (s *Store) DeleteChat(ctx context.Context, chatID uuid.UUID, userID string, isAdmin bool) error {
+	var kind, createdBy string
+	err := s.pool.QueryRow(ctx, `SELECT kind, created_by FROM chats WHERE id = $1`, chatID).Scan(&kind, &createdBy)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		return err
+	}
+
+	if !isAdmin {
+		if kind == "direct" {
+			var isMember bool
+			_ = s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM chat_members WHERE chat_id = $1 AND user_id = $2)`, chatID, userID).Scan(&isMember)
+			if !isMember {
+				return fmt.Errorf("forbidden: not a participant of this direct chat")
+			}
+		} else if createdBy != userID {
+			return fmt.Errorf("forbidden: only creator or admin can delete chat")
+		}
+	}
+
+	_, err = s.pool.Exec(ctx, `DELETE FROM chats WHERE id = $1`, chatID)
+	return err
+}
+
 // ListUserChats возвращает список чатов пользователя с вычисленным количеством непрочитанных сообщений.
 func (s *Store) ListUserChats(ctx context.Context, userID string, groups []string, dept, role string) ([]Chat, error) {
 	// Суперпользователь или chat_admin видит все чаты, иначе только те, где участник или есть правило доступа
