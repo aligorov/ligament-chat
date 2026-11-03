@@ -1,0 +1,19 @@
+# Binaries
+bin/
+tmp/
+*.exe
+*.dll
+*.so
+*.dylib
+chat
+
+# OS & Editors
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Test & coverage
+coverage.out
+*.test

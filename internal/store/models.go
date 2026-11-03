@@ -1,0 +1,120 @@
+package store
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// Роли участников в чате
+const (
+	MemberRoleAdmin     = "admin"
+	MemberRoleModerator = "moderator"
+	MemberRoleMember    = "member"
+)
+
+// Типы чатов
+const (
+	ChatKindDirect  = "direct"
+	ChatKindGroup   = "group"
+	ChatKindChannel = "channel"
+	ChatKindSaved   = "saved"
+)
+
+// Типы сообщений
+const (
+	MsgKindText       = "text"
+	MsgKindSecret     = "secret"      // One-time self-destructing secret
+	MsgKindActionCard = "action_card"  // 2FA approval card
+	MsgKindLinkCall   = "link_call"    // WebRTC call status / invite
+	MsgKindSystem     = "system"
+)
+
+// Chat представляет чат или форум
+type Chat struct {
+	ID          uuid.UUID `json:"id"`
+	Kind        string    `json:"kind"`
+	Title       string    `json:"title"`
+	Description string    `json:"description"`
+	AvatarURL   string    `json:"avatar_url"`
+	IsForum     bool      `json:"is_forum"`
+	IsArchived  bool      `json:"is_archived"`
+	CreatedBy   string    `json:"created_by"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+	UnreadCount int       `json:"unread_count"`
+}
+
+// ChatTopic представляет топик (тему) в форуме
+type ChatTopic struct {
+	ID          int64     `json:"id"`
+	ChatID      uuid.UUID `json:"chat_id"`
+	Title       string    `json:"title"`
+	IconEmoji   string    `json:"icon_emoji"`
+	IsGeneral   bool      `json:"is_general"`
+	IsClosed    bool      `json:"is_closed"`
+	IsPinned    bool      `json:"is_pinned"`
+	CreatedBy   string    `json:"created_by"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+	UnreadCount int       `json:"unread_count"`
+}
+
+// Message представляет отдельное сообщение
+type Message struct {
+	ID               int64          `json:"id"`
+	ChatID           uuid.UUID      `json:"chat_id"`
+	TopicID          int64          `json:"topic_id"`
+	SenderID         string         `json:"sender_id"`
+	SenderName       string         `json:"sender_name"`
+	ClientMsgID      string         `json:"client_msg_id"`
+	ReplyToID        *int64         `json:"reply_to_id,omitempty"`
+	Body             string         `json:"body"`
+	Kind             string         `json:"kind"`
+	SecretTTLSeconds *int           `json:"secret_ttl_seconds,omitempty"`
+	SecretReadAt     *time.Time     `json:"secret_read_at,omitempty"`
+	Metadata         map[string]any `json:"metadata,omitempty"`
+	CreatedAt        time.Time      `json:"created_at"`
+	EditedAt         *time.Time     `json:"edited_at,omitempty"`
+	DeletedAt        *time.Time     `json:"deleted_at,omitempty"`
+	Attachments      []Attachment   `json:"attachments,omitempty"`
+}
+
+// Attachment представляет вложенный файл
+type Attachment struct {
+	ID          uuid.UUID `json:"id"`
+	MessageID   int64     `json:"message_id"`
+	ChatID      uuid.UUID `json:"chat_id"`
+	FileName    string    `json:"file_name"`
+	FileSize    int64     `json:"file_size"`
+	ContentType string    `json:"content_type"`
+	StoragePath string    `json:"storage_path"`
+	SHA256Hex   string    `json:"sha256_hex"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+// GroupAccessRule связывает чат с AD-группой, отделом или пользователем
+type GroupAccessRule struct {
+	ID          uuid.UUID `json:"id"`
+	ChatID      uuid.UUID `json:"chat_id"`
+	RuleType    string    `json:"rule_type"` // ad_group, department, role, user
+	TargetName  string    `json:"target_name"`
+	CanWrite    bool      `json:"can_write"`
+	CanCall     bool      `json:"can_call"`
+	IsModerator bool      `json:"is_moderator"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+// CallSession описывает сеанс WebRTC звонка
+type CallSession struct {
+	ID                uuid.UUID  `json:"id"`
+	ChatID            uuid.UUID  `json:"chat_id"`
+	CallerUserID      string     `json:"caller_user_id"`
+	CalleeUserID      string     `json:"callee_user_id"`
+	Status            string     `json:"status"` // ringing, active, ended, rejected, missed
+	IsRecorded        bool       `json:"is_recorded"`
+	RecorderSessionID *uuid.UUID `json:"recorder_session_id,omitempty"`
+	StartedAt         *time.Time `json:"started_at,omitempty"`
+	EndedAt           *time.Time `json:"ended_at,omitempty"`
+	CreatedAt         time.Time  `json:"created_at"`
+}

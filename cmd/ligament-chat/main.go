@@ -1,0 +1,96 @@
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"syscall"
+	"time"
+
+	"github.com/aligorov/ligament-chat/internal/api"
+	"github.com/aligorov/ligament-chat/internal/store"
+)
+
+var (
+	Version   = "v0.1.0"
+	BuildDate = "2026-11-03"
+)
+
+func main() {
+	listenAddr := flag.String("listen", "0.0.0.0:8097", "HTTP/WS listen address")
+	dataDir := flag.String("data-dir", "/var/lib/ligament-chat", "Directory for attachments and media")
+	dbSocket := flag.String("db-socket", "/var/run/postgresql", "PostgreSQL Unix socket directory")
+	dbUser := flag.String("db-user", "chat", "PostgreSQL database user")
+	dbName := flag.String("db-name", "ligament_chat", "PostgreSQL database name")
+	dbConnStr := flag.String("db-conn", "", "Explicit PostgreSQL connection string (overrides socket)")
+	recorderURL := flag.String("recorder-url", "http://127.0.0.1:8095", "Ligament Recorder base URL")
+	flag.Parse()
+
+	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	slog.SetDefault(logger)
+
+	slog.Info("ligament-chat starting", "version", Version, "build_date", BuildDate, "listen", *listenAddr)
+
+	if err := os.MkdirAll(filepath.Join(*dataDir, "attachments"), 0755); err != nil {
+		slog.Error("failed to create data directory", "err", err)
+		os.Exit(1)
+	}
+
+	connStr := *dbConnStr
+	if connStr == "" {
+		connStr = fmt.Sprintf("postgres://%s@/%s?host=%s", *dbUser, *dbName, *dbSocket)
+	}
+
+	st := store.NewStore()
+	defer st.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	if err := st.AttachPostgres(ctx, connStr); err != nil {
+		cancel()
+		slog.Error("failed to attach to postgres", "err", err, "conn", connStr)
+		os.Exit(1)
+	}
+	cancel()
+	slog.Info("connected to postgres and verified schema migrations")
+
+	hub := api.NewHub()
+	stopHub := make(chan struct{})
+	go hub.Run(stopHub)
+
+	srv := api.NewServer(st, hub, *dataDir, *recorderURL)
+
+	httpServer := &http.Server{
+		Addr:              *listenAddr,
+		Handler:           srv,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	go func() {
+		slog.Info("chat server listening", "addr", *listenAddr)
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slog.Error("http server failed", "err", err)
+			os.Exit(1)
+		}
+	}()
+
+	<-ctx.Done()
+	slog.Info("shutting down gracefully...")
+
+	close(stopHub)
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		slog.Error("server shutdown error", "err", err)
+	}
+	slog.Info("ligament-chat stopped")
+}
