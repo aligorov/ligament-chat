@@ -32,6 +32,13 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      # URL сервера Ligament 2FA Core (Identity Provider & SSO)
+      CORE_URL: "${CORE_URL:-http://host.docker.internal:8080}"
+      # URL сервиса записи сессий Ligament Recorder (опционально)
+      RECORDER_URL: "${RECORDER_URL:-http://host.docker.internal:8095}"
     ports:
       - "8097:8097"
     volumes:
@@ -48,6 +55,8 @@ services:
       - "chat"
       - "-db-name"
       - "ligament_chat"
+      - "-core-url"
+      - "${CORE_URL:-http://host.docker.internal:8080}"
 
 volumes:
   chat_pgdata:

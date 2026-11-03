@@ -12,15 +12,17 @@ type Server struct {
 	mux         *http.ServeMux
 	dataDir     string
 	recorderURL string
+	coreURL     string
 }
 
-func NewServer(st *store.Store, hub *Hub, dataDir, recorderURL string) *Server {
+func NewServer(st *store.Store, hub *Hub, dataDir, recorderURL, coreURL string) *Server {
 	s := &Server{
 		st:          st,
 		hub:         hub,
 		mux:         http.NewServeMux(),
 		dataDir:     dataDir,
 		recorderURL: recorderURL,
+		coreURL:     coreURL,
 	}
 
 	s.routes()
@@ -30,7 +32,11 @@ func NewServer(st *store.Store, hub *Hub, dataDir, recorderURL string) *Server {
 func (s *Server) routes() {
 	// Healthcheck
 	s.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+		writeJSON(w, http.StatusOK, map[string]string{
+			"status":   "ok",
+			"service":  "ligament-chat",
+			"core_url": s.coreURL,
+		})
 	})
 
 	// Core Trust handshake

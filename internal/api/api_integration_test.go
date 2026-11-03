@@ -62,7 +62,7 @@ func setupTestEnvironment(t *testing.T) (*Server, *store.Store, ed25519.PublicKe
 		st.Close()
 	})
 
-	srv := NewServer(st, hub, t.TempDir(), "")
+	srv := NewServer(st, hub, t.TempDir(), "", "http://127.0.0.1:8080")
 	return srv, st, corePub, corePriv, coreInstanceID
 }
 

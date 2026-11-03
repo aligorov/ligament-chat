@@ -29,12 +29,25 @@ func main() {
 	dbName := flag.String("db-name", "ligament_chat", "PostgreSQL database name")
 	dbConnStr := flag.String("db-conn", "", "Explicit PostgreSQL connection string (overrides socket)")
 	recorderURL := flag.String("recorder-url", "http://127.0.0.1:8095", "Ligament Recorder base URL")
+	coreURL := flag.String("core-url", "http://127.0.0.1:8080", "Ligament 2FA Core base URL")
 	flag.Parse()
+
+	resolvedCore := *coreURL
+	if envCore := os.Getenv("CORE_URL"); envCore != "" && *coreURL == "http://127.0.0.1:8080" {
+		resolvedCore = envCore
+	} else if envTwoFA := os.Getenv("TWOFA_URL"); envTwoFA != "" && *coreURL == "http://127.0.0.1:8080" {
+		resolvedCore = envTwoFA
+	}
+
+	resolvedRecorder := *recorderURL
+	if envRec := os.Getenv("RECORDER_URL"); envRec != "" && *recorderURL == "http://127.0.0.1:8095" {
+		resolvedRecorder = envRec
+	}
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
 
-	slog.Info("ligament-chat starting", "version", Version, "build_date", BuildDate, "listen", *listenAddr)
+	slog.Info("ligament-chat starting", "version", Version, "build_date", BuildDate, "listen", *listenAddr, "core_url", resolvedCore)
 
 	if err := os.MkdirAll(filepath.Join(*dataDir, "attachments"), 0755); err != nil {
 		slog.Error("failed to create data directory", "err", err)
@@ -68,7 +81,7 @@ func main() {
 	stopHub := make(chan struct{})
 	go hub.Run(stopHub)
 
-	srv := api.NewServer(st, hub, *dataDir, *recorderURL)
+	srv := api.NewServer(st, hub, *dataDir, resolvedRecorder, resolvedCore)
 
 	httpServer := &http.Server{
 		Addr:              *listenAddr,
