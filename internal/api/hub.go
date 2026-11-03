@@ -104,6 +104,14 @@ func (h *Hub) Run(stop <-chan struct{}) {
 				h.userClients[client.userID] = make(map[*Client]bool)
 			}
 			h.userClients[client.userID][client] = true
+			userRoom := "user:" + client.userID
+			if _, ok := h.roomClients[userRoom]; !ok {
+				h.roomClients[userRoom] = make(map[*Client]bool)
+			}
+			h.roomClients[userRoom][client] = true
+			client.roomsMu.Lock()
+			client.rooms[userRoom] = true
+			client.roomsMu.Unlock()
 			h.mu.Unlock()
 
 		case client := <-h.unregister:
@@ -331,12 +339,13 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	userID := getUserID(claims)
 	client := &Client{
 		hub:     s.hub,
 		st:      s.st,
 		claims:  claims,
 		conn:    conn,
-		userID:  claims.Subject,
+		userID:  userID,
 		send:    make(chan []byte, 256),
 		rooms:   make(map[string]bool),
 	}

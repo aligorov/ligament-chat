@@ -6,14 +6,26 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/aligorov/ligament-chat/internal/contract"
 	"github.com/aligorov/ligament-chat/internal/store"
 	"github.com/google/uuid"
 )
 
+func getUserID(claims *contract.ChatClaims) string {
+	if claims == nil {
+		return ""
+	}
+	if claims.Username != "" {
+		return claims.Username
+	}
+	return claims.Subject
+}
+
 // handleListChats — GET /api/v1/chats
 func (s *Server) handleListChats(w http.ResponseWriter, r *http.Request) {
 	claims, _ := claimsFromContext(r.Context())
-	chats, err := s.st.ListUserChats(r.Context(), claims.Subject, claims.ADGroups, claims.Department, claims.Role)
+	userID := getUserID(claims)
+	chats, err := s.st.ListUserChats(r.Context(), userID, claims.ADGroups, claims.Department, claims.Role)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed_to_list_chats"})
 		return
@@ -25,11 +37,13 @@ func (s *Server) handleListChats(w http.ResponseWriter, r *http.Request) {
 }
 
 type createChatReq struct {
-	Kind           string                  `json:"kind"` // direct, group, channel
+	Kind           string                  `json:"kind"` // direct, group, channel, forum
 	Title          string                  `json:"title"`
 	Description    string                  `json:"description"`
 	AvatarURL      string                  `json:"avatar_url"`
 	IsForum        bool                    `json:"is_forum"`
+	TargetUser     string                  `json:"target_user"`
+	Members        []string                `json:"members"`
 	InitialMembers []string                `json:"initial_members"`
 	AccessRules    []store.GroupAccessRule `json:"access_rules"`
 }
@@ -37,6 +51,8 @@ type createChatReq struct {
 // handleCreateChat — POST /api/v1/chats
 func (s *Server) handleCreateChat(w http.ResponseWriter, r *http.Request) {
 	claims, _ := claimsFromContext(r.Context())
+	userID := getUserID(claims)
+
 	var req createChatReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
@@ -47,9 +63,62 @@ func (s *Server) handleCreateChat(w http.ResponseWriter, r *http.Request) {
 	if req.Kind == "" {
 		req.Kind = store.ChatKindGroup
 	}
-	if req.Kind != store.ChatKindDirect && req.Title == "" {
+
+	// 1. Создание или открытие существующего личного диалога 1-на-1
+	if req.Kind == store.ChatKindDirect {
+		target := strings.TrimSpace(req.TargetUser)
+		if target == "" && len(req.InitialMembers) > 0 {
+			target = strings.TrimSpace(req.InitialMembers[0])
+		}
+		if target == "" && len(req.Members) > 0 {
+			target = strings.TrimSpace(req.Members[0])
+		}
+		if target == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "target_user_required"})
+			return
+		}
+
+		chat, err := s.st.GetOrCreateDirectChat(r.Context(), userID, target)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed_to_create_direct_chat"})
+			return
+		}
+
+		// Трансляция события создания диалога в WebSocket-комнаты обоих участников
+		createdMsg := HubMessage{
+			Type:    "chat.created",
+			ChatID:  chat.ID.String(),
+			Payload: map[string]any{"chat": chat},
+		}
+		s.hub.SendDirect(userID, createdMsg)
+		s.hub.SendDirect(target, createdMsg)
+		s.hub.BroadcastToRoom("user:"+userID, createdMsg)
+		s.hub.BroadcastToRoom("user:"+target, createdMsg)
+
+		writeJSON(w, http.StatusOK, chat)
+		return
+	}
+
+	// 2. Создание группы, канала или форума
+	if req.Title == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "empty_chat_title"})
 		return
+	}
+
+	membersMap := make(map[string]struct{})
+	for _, m := range req.InitialMembers {
+		if tr := strings.TrimSpace(m); tr != "" {
+			membersMap[tr] = struct{}{}
+		}
+	}
+	for _, m := range req.Members {
+		if tr := strings.TrimSpace(m); tr != "" {
+			membersMap[tr] = struct{}{}
+		}
+	}
+	var allMembers []string
+	for m := range membersMap {
+		allMembers = append(allMembers, m)
 	}
 
 	chat := &store.Chat{
@@ -59,10 +128,10 @@ func (s *Server) handleCreateChat(w http.ResponseWriter, r *http.Request) {
 		Description: req.Description,
 		AvatarURL:   req.AvatarURL,
 		IsForum:     req.IsForum,
-		CreatedBy:   claims.Subject,
+		CreatedBy:   userID,
 	}
 
-	if err := s.st.CreateChat(r.Context(), chat, req.InitialMembers, req.AccessRules); err != nil {
+	if err := s.st.CreateChat(r.Context(), chat, allMembers, req.AccessRules); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed_to_create_chat"})
 		return
 	}
@@ -73,6 +142,8 @@ func (s *Server) handleCreateChat(w http.ResponseWriter, r *http.Request) {
 // handleGetChat — GET /api/v1/chats/{id}
 func (s *Server) handleGetChat(w http.ResponseWriter, r *http.Request) {
 	claims, _ := claimsFromContext(r.Context())
+	userID := getUserID(claims)
+
 	chatIDStr := r.PathValue("id")
 	chatID, err := uuid.Parse(chatIDStr)
 	if err != nil {
@@ -80,13 +151,13 @@ func (s *Server) handleGetChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ok, _, err := s.st.CanAccessChat(r.Context(), chatID, claims.Subject, claims.ADGroups, claims.Department, claims.Role)
+	ok, _, err := s.st.CanAccessChat(r.Context(), chatID, userID, claims.ADGroups, claims.Department, claims.Role)
 	if err != nil || !ok {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "access_denied"})
 		return
 	}
 
-	chat, err := s.st.GetChat(r.Context(), chatID)
+	chat, err := s.st.GetChat(r.Context(), chatID, userID)
 	if err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "chat_not_found"})
 		return
@@ -98,6 +169,7 @@ func (s *Server) handleGetChat(w http.ResponseWriter, r *http.Request) {
 // handleListTopics — GET /api/v1/chats/{id}/topics
 func (s *Server) handleListTopics(w http.ResponseWriter, r *http.Request) {
 	claims, _ := claimsFromContext(r.Context())
+	userID := getUserID(claims)
 	chatIDStr := r.PathValue("id")
 	chatID, err := uuid.Parse(chatIDStr)
 	if err != nil {
@@ -105,13 +177,13 @@ func (s *Server) handleListTopics(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ok, _, err := s.st.CanAccessChat(r.Context(), chatID, claims.Subject, claims.ADGroups, claims.Department, claims.Role)
+	ok, _, err := s.st.CanAccessChat(r.Context(), chatID, userID, claims.ADGroups, claims.Department, claims.Role)
 	if err != nil || !ok {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "access_denied"})
 		return
 	}
 
-	topics, err := s.st.ListChatTopics(r.Context(), chatID, claims.Subject)
+	topics, err := s.st.ListChatTopics(r.Context(), chatID, userID)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed_to_list_topics"})
 		return
@@ -131,6 +203,7 @@ type createTopicReq struct {
 // handleCreateTopic — POST /api/v1/chats/{id}/topics
 func (s *Server) handleCreateTopic(w http.ResponseWriter, r *http.Request) {
 	claims, _ := claimsFromContext(r.Context())
+	userID := getUserID(claims)
 	chatIDStr := r.PathValue("id")
 	chatID, err := uuid.Parse(chatIDStr)
 	if err != nil {
@@ -138,7 +211,7 @@ func (s *Server) handleCreateTopic(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ok, role, err := s.st.CanAccessChat(r.Context(), chatID, claims.Subject, claims.ADGroups, claims.Department, claims.Role)
+	ok, role, err := s.st.CanAccessChat(r.Context(), chatID, userID, claims.ADGroups, claims.Department, claims.Role)
 	if err != nil || !ok {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "access_denied"})
 		return
@@ -167,7 +240,7 @@ func (s *Server) handleCreateTopic(w http.ResponseWriter, r *http.Request) {
 		ChatID:    chatID,
 		Title:     req.Title,
 		IconEmoji: req.IconEmoji,
-		CreatedBy: claims.Subject,
+		CreatedBy: userID,
 	}
 
 	if err := s.st.CreateTopic(r.Context(), topic); err != nil {
@@ -185,6 +258,7 @@ func (s *Server) handleCreateTopic(w http.ResponseWriter, r *http.Request) {
 // handleListMessages — GET /api/v1/chats/{id}/messages
 func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 	claims, _ := claimsFromContext(r.Context())
+	userID := getUserID(claims)
 	chatIDStr := r.PathValue("id")
 	chatID, err := uuid.Parse(chatIDStr)
 	if err != nil {
@@ -192,7 +266,7 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ok, _, err := s.st.CanAccessChat(r.Context(), chatID, claims.Subject, claims.ADGroups, claims.Department, claims.Role)
+	ok, _, err := s.st.CanAccessChat(r.Context(), chatID, userID, claims.ADGroups, claims.Department, claims.Role)
 	if err != nil || !ok {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "access_denied"})
 		return
@@ -239,6 +313,7 @@ type sendMessageReq struct {
 // handleSendMessage — POST /api/v1/chats/{id}/messages
 func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 	claims, _ := claimsFromContext(r.Context())
+	userID := getUserID(claims)
 	chatIDStr := r.PathValue("id")
 	chatID, err := uuid.Parse(chatIDStr)
 	if err != nil {
@@ -246,7 +321,7 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ok, role, err := s.st.CanAccessChat(r.Context(), chatID, claims.Subject, claims.ADGroups, claims.Department, claims.Role)
+	ok, role, err := s.st.CanAccessChat(r.Context(), chatID, userID, claims.ADGroups, claims.Department, claims.Role)
 	if err != nil || !ok {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "access_denied"})
 		return
@@ -277,13 +352,13 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 
 	senderName := claims.ActorName
 	if senderName == "" {
-		senderName = claims.Username
+		senderName = userID
 	}
 
 	msg := &store.Message{
 		ChatID:           chatID,
 		TopicID:          req.TopicID,
-		SenderID:         claims.Subject,
+		SenderID:         userID,
 		SenderName:       senderName,
 		ClientMsgID:      clientMsgID,
 		ReplyToID:        req.ReplyToID,
@@ -299,7 +374,7 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Отправитель автоматически сдвигает свой read pointer на отправленное сообщение
-	_ = s.st.UpdateReadPointer(r.Context(), chatID, req.TopicID, claims.Subject, msg.ID)
+	_ = s.st.UpdateReadPointer(r.Context(), chatID, req.TopicID, userID, msg.ID)
 
 	// Broadcast нового сообщения в WebSocket комнату
 	s.hub.BroadcastToRoom("chat:"+chatID.String(), HubMessage{
@@ -322,6 +397,7 @@ type readPointerReq struct {
 // handleReadPointer — POST /api/v1/chats/{id}/read
 func (s *Server) handleReadPointer(w http.ResponseWriter, r *http.Request) {
 	claims, _ := claimsFromContext(r.Context())
+	userID := getUserID(claims)
 	chatIDStr := r.PathValue("id")
 	chatID, err := uuid.Parse(chatIDStr)
 	if err != nil {
@@ -335,7 +411,7 @@ func (s *Server) handleReadPointer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.st.UpdateReadPointer(r.Context(), chatID, req.TopicID, claims.Subject, req.LastReadID); err != nil {
+	if err := s.st.UpdateReadPointer(r.Context(), chatID, req.TopicID, userID, req.LastReadID); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed_to_update_read_pointer"})
 		return
 	}
@@ -346,7 +422,7 @@ func (s *Server) handleReadPointer(w http.ResponseWriter, r *http.Request) {
 		ChatID:  chatID.String(),
 		TopicID: req.TopicID,
 		Payload: map[string]any{
-			"user_id":      claims.Subject,
+			"user_id":      userID,
 			"last_read_id": req.LastReadID,
 		},
 	})

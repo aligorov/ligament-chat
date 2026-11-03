@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io/fs"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/aligorov/ligament-chat/migrations"
@@ -215,17 +216,104 @@ func (s *Store) CreateChat(ctx context.Context, chat *Chat, initialMembers []str
 	return tx.Commit(ctx)
 }
 
-// GetChat возвращает информацию о чате по ID.
-func (s *Store) GetChat(ctx context.Context, chatID uuid.UUID) (*Chat, error) {
+// GetChat возвращает информацию о чате по ID (с адаптивным заголовком для direct-диалогов).
+func (s *Store) GetChat(ctx context.Context, chatID uuid.UUID, forUserID string) (*Chat, error) {
 	var c Chat
 	err := s.pool.QueryRow(ctx, `
-		SELECT id, kind, title, description, avatar_url, is_forum, is_archived, created_by, created_at, updated_at
-		FROM chats WHERE id = $1
-	`, chatID).Scan(&c.ID, &c.Kind, &c.Title, &c.Description, &c.AvatarURL, &c.IsForum, &c.IsArchived, &c.CreatedBy, &c.CreatedAt, &c.UpdatedAt)
+		SELECT c.id, c.kind,
+		       CASE
+		           WHEN c.kind = 'direct' THEN COALESCE(
+		               NULLIF((SELECT cm_peer.user_id FROM chat_members cm_peer WHERE cm_peer.chat_id = c.id AND cm_peer.user_id != $2 LIMIT 1), ''),
+		               c.title
+		           )
+		           ELSE c.title
+		       END AS title,
+		       c.description, c.avatar_url, c.is_forum, c.is_archived, c.created_by, c.created_at, c.updated_at
+		FROM chats c WHERE c.id = $1
+	`, chatID, forUserID).Scan(&c.ID, &c.Kind, &c.Title, &c.Description, &c.AvatarURL, &c.IsForum, &c.IsArchived, &c.CreatedBy, &c.CreatedAt, &c.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
 	return &c, nil
+}
+
+// GetOrCreateDirectChat находит существующий или создаёт новый прямой диалог 1-на-1 между user1 и user2.
+func (s *Store) GetOrCreateDirectChat(ctx context.Context, user1, user2 string) (*Chat, error) {
+	if s == nil || s.pool == nil {
+		return nil, fmt.Errorf("store: nil pool")
+	}
+
+	user1 = strings.TrimSpace(user1)
+	user2 = strings.TrimSpace(user2)
+	if user1 == "" || user2 == "" {
+		return nil, fmt.Errorf("store: empty users for direct chat")
+	}
+
+	// 1. Поиск существующего direct-диалога между этими двумя участниками
+	var existID uuid.UUID
+	err := s.pool.QueryRow(ctx, `
+		SELECT cm1.chat_id
+		FROM chat_members cm1
+		JOIN chat_members cm2 ON cm1.chat_id = cm2.chat_id
+		JOIN chats c ON c.id = cm1.chat_id
+		WHERE c.kind = 'direct' AND cm1.user_id = $1 AND cm2.user_id = $2
+		LIMIT 1
+	`, user1, user2).Scan(&existID)
+
+	if err == nil && existID != uuid.Nil {
+		return s.GetChat(ctx, existID, user1)
+	}
+
+	// 2. Создание нового диалога
+	chatID := uuid.New()
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin direct chat tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	chat := &Chat{
+		ID:        chatID,
+		Kind:      ChatKindDirect,
+		Title:     user2,
+		CreatedBy: user1,
+	}
+
+	err = tx.QueryRow(ctx, `
+		INSERT INTO chats (id, kind, title, description, avatar_url, is_forum, is_archived, created_by, created_at, updated_at)
+		VALUES ($1, 'direct', $2, '', '', FALSE, FALSE, $3, NOW(), NOW())
+		RETURNING created_at, updated_at
+	`, chatID, user2, user1).Scan(&chat.CreatedAt, &chat.UpdatedAt)
+	if err != nil {
+		return nil, fmt.Errorf("insert direct chat: %w", err)
+	}
+
+	// Добавляем обоих участников
+	_, err = tx.Exec(ctx, `
+		INSERT INTO chat_members (chat_id, user_id, role, joined_at)
+		VALUES ($1, $2, 'member', NOW())
+		ON CONFLICT (chat_id, user_id) DO NOTHING
+	`, chatID, user1)
+	if err != nil {
+		return nil, fmt.Errorf("add direct member 1: %w", err)
+	}
+
+	if user1 != user2 {
+		_, err = tx.Exec(ctx, `
+			INSERT INTO chat_members (chat_id, user_id, role, joined_at)
+			VALUES ($1, $2, 'member', NOW())
+			ON CONFLICT (chat_id, user_id) DO NOTHING
+		`, chatID, user2)
+		if err != nil {
+			return nil, fmt.Errorf("add direct member 2: %w", err)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit direct chat: %w", err)
+	}
+
+	return chat, nil
 }
 
 // ListUserChats возвращает список чатов пользователя с вычисленным количеством непрочитанных сообщений.
@@ -234,7 +322,15 @@ func (s *Store) ListUserChats(ctx context.Context, userID string, groups []strin
 	isAdmin := role == "chat_admin" || role == "admin" || role == "superadmin"
 
 	query := `
-		SELECT c.id, c.kind, c.title, c.description, c.avatar_url, c.is_forum, c.is_archived, c.created_by, c.created_at, c.updated_at,
+		SELECT c.id, c.kind,
+		       CASE
+		           WHEN c.kind = 'direct' THEN COALESCE(
+		               NULLIF((SELECT cm_peer.user_id FROM chat_members cm_peer WHERE cm_peer.chat_id = c.id AND cm_peer.user_id != $1 LIMIT 1), ''),
+		               c.title
+		           )
+		           ELSE c.title
+		       END AS title,
+		       c.description, c.avatar_url, c.is_forum, c.is_archived, c.created_by, c.created_at, c.updated_at,
 		       COALESCE((
 		           SELECT COUNT(*)
 		           FROM messages m
