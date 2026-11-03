@@ -70,10 +70,25 @@ type updateCallStatusReq struct {
 
 // handleCallStatus — POST /api/v1/calls/{id}/status
 func (s *Server) handleCallStatus(w http.ResponseWriter, r *http.Request) {
+	claims, _ := claimsFromContext(r.Context())
+	userID := getUserID(claims)
+
 	callIDStr := r.PathValue("id")
 	callID, err := uuid.Parse(callIDStr)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_call_id"})
+		return
+	}
+
+	call, err := s.st.GetCallSession(r.Context(), callID)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "call_not_found"})
+		return
+	}
+
+	isAdmin := claims != nil && (claims.Role == "admin" || claims.Role == "superadmin" || claims.Role == "chat_admin")
+	if !isAdmin && call.CallerUserID != userID && call.CalleeUserID != userID {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "access_denied_to_call"})
 		return
 	}
 
@@ -98,10 +113,25 @@ type toggleRecordingReq struct {
 // handleToggleRecording — POST /api/v1/calls/{id}/record
 // Переключение записи звонка в ligament-recoder
 func (s *Server) handleToggleRecording(w http.ResponseWriter, r *http.Request) {
+	claims, _ := claimsFromContext(r.Context())
+	userID := getUserID(claims)
+
 	callIDStr := r.PathValue("id")
 	callID, err := uuid.Parse(callIDStr)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_call_id"})
+		return
+	}
+
+	call, err := s.st.GetCallSession(r.Context(), callID)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "call_not_found"})
+		return
+	}
+
+	isAdmin := claims != nil && (claims.Role == "admin" || claims.Role == "superadmin" || claims.Role == "chat_admin")
+	if !isAdmin && call.CallerUserID != userID && call.CalleeUserID != userID {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "access_denied_to_call"})
 		return
 	}
 

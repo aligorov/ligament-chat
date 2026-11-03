@@ -33,7 +33,7 @@ services:
       postgres:
         condition: service_healthy
     ports:
-      - "8097:8097"
+      - "127.0.0.1:8097:8097"
     volumes:
       - chat_data:/var/lib/ligament-chat
       - chat_pgsocket:/var/run/postgresql

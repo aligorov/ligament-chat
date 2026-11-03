@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"encoding/hex"
@@ -77,6 +78,16 @@ func (s *Server) handleRegisterTrust(w http.ResponseWriter, r *http.Request) {
 	if !ed25519.Verify(pubBytes, []byte(msg), sigBytes) {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "invalid_signature"})
 		return
+	}
+
+	// Защита от подмены ключей (Key Substitution Attack / TOFU):
+	// Если инстанс уже зарегистрирован, запрещаем перезапись публичного ключа другим ключом.
+	existingPub, _, err := s.st.GetTrust(r.Context(), instanceID.String())
+	if err == nil && len(existingPub) == ed25519.PublicKeySize {
+		if !bytes.Equal(existingPub, pubBytes) {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "instance_already_registered_with_different_key"})
+			return
+		}
 	}
 
 	if err := s.st.SaveTrust(r.Context(), instanceID.String(), req.PublicKeyHex, req.TenantScope); err != nil {

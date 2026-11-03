@@ -71,8 +71,14 @@ func (s *Server) handleUploadAttachment(w http.ResponseWriter, r *http.Request) 
 	}
 
 	contentType := header.Header.Get("Content-Type")
-	if contentType == "" {
-		contentType = "application/octet-stream"
+	if contentType == "" || contentType == "application/octet-stream" {
+		buf := make([]byte, 512)
+		if n, _ := file.Read(buf); n > 0 {
+			contentType = http.DetectContentType(buf[:n])
+			_, _ = file.Seek(0, io.SeekStart)
+		} else {
+			contentType = "application/octet-stream"
+		}
 	}
 
 	att := &store.Attachment{
@@ -125,12 +131,29 @@ func (s *Server) handleDownloadAttachment(w http.ResponseWriter, r *http.Request
 	defer f.Close()
 
 	w.Header().Set("Content-Type", att.ContentType)
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Cache-Control", "public, max-age=86400")
-	if strings.HasPrefix(att.ContentType, "image/") || strings.HasPrefix(att.ContentType, "video/") || att.ContentType == "application/pdf" {
-		w.Header().Set("Content-Disposition", "inline; filename=\""+att.FileName+"\"")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; sandbox;")
+	w.Header().Set("Cache-Control", "private, no-cache, no-store, must-revalidate")
+
+	// Разрешаем inline только для строго безопасных растровых форматов изображений и стандартного медиа,
+	// где исключена возможность исполнения встроенных JS-скриптов в контексте страницы.
+	// SVG, HTML, PDF и исполняемые файлы принудительно отдаются как attachment!
+	isSafeInline := false
+	switch att.ContentType {
+	case "image/jpeg", "image/png", "image/webp", "image/gif":
+		isSafeInline = true
+	case "audio/mpeg", "audio/ogg", "audio/webm", "video/mp4", "video/webm":
+		isSafeInline = true
+	}
+
+	cleanName := strings.ReplaceAll(att.FileName, `"`, `_`)
+	cleanName = strings.ReplaceAll(cleanName, "\r", "")
+	cleanName = strings.ReplaceAll(cleanName, "\n", "")
+
+	if isSafeInline {
+		w.Header().Set("Content-Disposition", "inline; filename=\""+cleanName+"\"")
 	} else {
-		w.Header().Set("Content-Disposition", "attachment; filename=\""+att.FileName+"\"")
+		w.Header().Set("Content-Disposition", "attachment; filename=\""+cleanName+"\"")
 	}
 
 	_, _ = io.Copy(w, f)

@@ -83,6 +83,44 @@ func NewHub() *Hub {
 	}
 }
 
+func (h *Hub) unregisterClientLocked(client *Client) {
+	if _, ok := h.clients[client]; !ok {
+		return
+	}
+	delete(h.clients, client)
+	close(client.send)
+	if uMap, ok := h.userClients[client.userID]; ok {
+		delete(uMap, client)
+		if len(uMap) == 0 {
+			delete(h.userClients, client.userID)
+		}
+	}
+	client.roomsMu.RLock()
+	for room := range client.rooms {
+		if rMap, ok := h.roomClients[room]; ok {
+			delete(rMap, client)
+			if len(rMap) == 0 {
+				delete(h.roomClients, room)
+			}
+		}
+	}
+	client.roomsMu.RUnlock()
+}
+
+// EvictUser немедленно завершает все активные WebSocket соединения пользователя (отзыв доступа).
+func (h *Hub) EvictUser(userID string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var targets []*Client
+	for client := range h.userClients[userID] {
+		targets = append(targets, client)
+	}
+	for _, client := range targets {
+		h.unregisterClientLocked(client)
+		_ = client.conn.Close()
+	}
+}
+
 func (h *Hub) Run(stop <-chan struct{}) {
 	for {
 		select {
@@ -117,51 +155,48 @@ func (h *Hub) Run(stop <-chan struct{}) {
 
 		case client := <-h.unregister:
 			h.mu.Lock()
-			if _, ok := h.clients[client]; ok {
-				delete(h.clients, client)
-				close(client.send)
-				if uMap, ok := h.userClients[client.userID]; ok {
-					delete(uMap, client)
-					if len(uMap) == 0 {
-						delete(h.userClients, client.userID)
-					}
-				}
-				client.roomsMu.RLock()
-				for room := range client.rooms {
-					if rMap, ok := h.roomClients[room]; ok {
-						delete(rMap, client)
-						if len(rMap) == 0 {
-							delete(h.roomClients, room)
-						}
-					}
-				}
-				client.roomsMu.RUnlock()
-			}
+			h.unregisterClientLocked(client)
 			h.mu.Unlock()
 
 		case ev := <-h.broadcast:
 			h.mu.RLock()
+			var deadClients []*Client
 			for client := range h.roomClients[ev.room] {
 				select {
 				case client.send <- ev.data:
 				default:
-					close(client.send)
-					delete(h.clients, client)
+					deadClients = append(deadClients, client)
 				}
 			}
 			h.mu.RUnlock()
 
+			if len(deadClients) > 0 {
+				h.mu.Lock()
+				for _, client := range deadClients {
+					h.unregisterClientLocked(client)
+				}
+				h.mu.Unlock()
+			}
+
 		case ev := <-h.direct:
 			h.mu.RLock()
+			var deadClients []*Client
 			for client := range h.userClients[ev.targetUserID] {
 				select {
 				case client.send <- ev.data:
 				default:
-					close(client.send)
-					delete(h.clients, client)
+					deadClients = append(deadClients, client)
 				}
 			}
 			h.mu.RUnlock()
+
+			if len(deadClients) > 0 {
+				h.mu.Lock()
+				for _, client := range deadClients {
+					h.unregisterClientLocked(client)
+				}
+				h.mu.Unlock()
+			}
 		}
 	}
 }
@@ -263,6 +298,20 @@ func (c *Client) readPump() {
 			}
 		case "chat.typing":
 			if msg.ChatID != "" {
+				chatID, err := uuid.Parse(msg.ChatID)
+				if err == nil && c.st != nil {
+					var groups []string
+					var dept, role string
+					if c.claims != nil {
+						groups = c.claims.ADGroups
+						dept = c.claims.Department
+						role = c.claims.Role
+					}
+					ok, _, aErr := c.st.CanAccessChat(context.Background(), chatID, c.userID, groups, dept, role)
+					if aErr != nil || !ok {
+						continue
+					}
+				}
 				roomKey := "chat:" + msg.ChatID
 				c.hub.BroadcastToRoom(roomKey, HubMessage{
 					Type:    "chat.typing",

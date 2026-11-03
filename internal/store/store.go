@@ -669,6 +669,19 @@ func (s *Store) CreateCallSession(ctx context.Context, call *CallSession) error 
 	return err
 }
 
+// GetCallSession возвращает сессию WebRTC звонка по ID.
+func (s *Store) GetCallSession(ctx context.Context, callID uuid.UUID) (*CallSession, error) {
+	var c CallSession
+	err := s.pool.QueryRow(ctx, `
+		SELECT id, chat_id, caller_user_id, callee_user_id, status, is_recorded, recorder_session_id, started_at, ended_at, created_at
+		FROM call_sessions WHERE id = $1
+	`, callID).Scan(&c.ID, &c.ChatID, &c.CallerUserID, &c.CalleeUserID, &c.Status, &c.IsRecorded, &c.RecorderSessionID, &c.StartedAt, &c.EndedAt, &c.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &c, nil
+}
+
 // UpdateCallSession обновляет статус и запись WebRTC звонка.
 func (s *Store) UpdateCallSession(ctx context.Context, callID uuid.UUID, status string, isRecorded bool, recID *uuid.UUID) error {
 	var startedAt, endedAt *time.Time
