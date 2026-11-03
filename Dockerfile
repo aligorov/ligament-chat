@@ -1,18 +1,30 @@
-FROM --platform=$BUILDPLATFORM golang:1.24-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.27.2-alpine AS builder
 
 ARG TARGETOS=linux
 ARG TARGETARCH=amd64
 ARG VERSION=v0.1.0
 ARG BUILD_DATE=2026-11-03
+ARG OBFUSCATE=true
 
 WORKDIR /app
 COPY go.mod go.sum ./
-RUN go mod download
+RUN for i in 1 2 3 4 5; do go mod download && break || sleep 3; done
+
+# git необходим garble для применения патчей к линкеру
+RUN apk add --no-cache git && go install mvdan.cc/garble@latest
 
 COPY . .
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath \
-    -ldflags="-w -s -X main.Version=${VERSION} -X main.BuildDate=${BUILD_DATE}" \
-    -o /app/ligament-chat ./cmd/ligament-chat
+RUN if [ "$OBFUSCATE" = "true" ]; then \
+      echo "==> Сборка с обфускацией Garble (-tiny) под ${TARGETOS}/${TARGETARCH}..." && \
+      GOTOOLCHAIN=local CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} garble -tiny build -trimpath \
+        -ldflags="-w -s -buildid= -X main.Version=${VERSION} -X main.BuildDate=${BUILD_DATE}" \
+        -o /app/ligament-chat ./cmd/ligament-chat; \
+    else \
+      echo "==> Стандартная сборка Go..." && \
+      CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath \
+        -ldflags="-w -s -buildid= -X main.Version=${VERSION} -X main.BuildDate=${BUILD_DATE}" \
+        -o /app/ligament-chat ./cmd/ligament-chat; \
+    fi
 
 FROM alpine:3.21
 ARG VERSION=v0.1.0
