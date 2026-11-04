@@ -254,8 +254,8 @@ func (s *Server) handleCreateTopic(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "access_denied"})
 		return
 	}
-	if role != store.MemberRoleAdmin && role != store.MemberRoleModerator {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "moderator_or_admin_required"})
+	if role == "viewer" || role == store.MemberRoleReadOnly {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "read_only_mode"})
 		return
 	}
 

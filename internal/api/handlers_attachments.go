@@ -61,15 +61,6 @@ func (s *Server) handleUploadAttachment(w http.ResponseWriter, r *http.Request) 
 	}
 	defer dst.Close()
 
-	hasher := sha256.New()
-	writer := io.MultiWriter(dst, hasher)
-	size, err := io.Copy(writer, file)
-	if err != nil {
-		slog.Error("chat: attachments write file failed", "err", err, "path", storagePath)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed_to_write_file"})
-		return
-	}
-
 	contentType := header.Header.Get("Content-Type")
 	if contentType == "" || contentType == "application/octet-stream" {
 		buf := make([]byte, 512)
@@ -79,6 +70,15 @@ func (s *Server) handleUploadAttachment(w http.ResponseWriter, r *http.Request) 
 		} else {
 			contentType = "application/octet-stream"
 		}
+	}
+
+	hasher := sha256.New()
+	writer := io.MultiWriter(dst, hasher)
+	size, err := io.Copy(writer, file)
+	if err != nil {
+		slog.Error("chat: attachments write file failed", "err", err, "path", storagePath)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed_to_write_file"})
+		return
 	}
 
 	att := &store.Attachment{
