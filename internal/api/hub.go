@@ -57,10 +57,23 @@ type Hub struct {
 	userClients   map[string]map[*Client]bool
 	roomClients   map[string]map[*Client]bool
 	userPresences map[string]*store.UserPresence
+	pendingCalls  map[string]*PendingCall // targetUserID -> PendingCall
 	register      chan *Client
 	unregister    chan *Client
 	broadcast     chan *broadcastEvent
 	direct        chan *directEvent
+}
+
+// PendingCall представляет отложенный входящий вызов (когда адресат временно не в сети / в фоне)
+type PendingCall struct {
+	CallerID  string
+	TargetID  string
+	ChatID    string
+	TopicID   int64
+	Payload   map[string]any
+	CreatedAt time.Time
+	ExpiresAt time.Time
+	Timer     *time.Timer
 }
 
 type broadcastEvent struct {
@@ -79,6 +92,7 @@ func NewHub(st ...*store.Store) *Hub {
 		userClients:   make(map[string]map[*Client]bool),
 		roomClients:   make(map[string]map[*Client]bool),
 		userPresences: make(map[string]*store.UserPresence),
+		pendingCalls:  make(map[string]*PendingCall),
 		register:      make(chan *Client),
 		unregister:    make(chan *Client),
 		broadcast:     make(chan *broadcastEvent, 256),
@@ -116,6 +130,15 @@ func (h *Hub) unregisterClientLocked(client *Client) {
 		delete(uMap, client)
 		if len(uMap) == 0 {
 			delete(h.userClients, client.userID)
+			// Если у пользователя не осталось активных сессий, отменяем инициированные им ожидающие звонки
+			for targetID, pc := range h.pendingCalls {
+				if pc.CallerID == client.userID {
+					if pc.Timer != nil {
+						pc.Timer.Stop()
+					}
+					delete(h.pendingCalls, targetID)
+				}
+			}
 		}
 	}
 	client.roomsMu.RLock()
@@ -141,6 +164,54 @@ func (h *Hub) EvictUser(userID string) {
 	for _, client := range targets {
 		h.unregisterClientLocked(client)
 		_ = client.conn.Close()
+	}
+}
+
+// CreatePendingCall ставит звонок в буфер ожидания пробуждения абонента
+func (h *Hub) CreatePendingCall(callerID, targetID, chatID string, topicID int64, payload map[string]any, ttl time.Duration, onTimeout func()) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	// Гасим предыдущий таймер, если для этого адресата уже был ожидающий вызов
+	if old, exists := h.pendingCalls[targetID]; exists && old.Timer != nil {
+		old.Timer.Stop()
+	}
+
+	pc := &PendingCall{
+		CallerID:  callerID,
+		TargetID:  targetID,
+		ChatID:    chatID,
+		TopicID:   topicID,
+		Payload:   payload,
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(ttl),
+	}
+
+	pc.Timer = time.AfterFunc(ttl, func() {
+		h.mu.Lock()
+		cur, exists := h.pendingCalls[targetID]
+		if exists && cur == pc {
+			delete(h.pendingCalls, targetID)
+		}
+		h.mu.Unlock()
+
+		if exists && cur == pc && onTimeout != nil {
+			onTimeout()
+		}
+	})
+
+	h.pendingCalls[targetID] = pc
+}
+
+// CancelPendingCall отменяет ожидающий вызов между звонящим и адресатом
+func (h *Hub) CancelPendingCall(callerID, targetID string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if pc, ok := h.pendingCalls[targetID]; ok && pc.CallerID == callerID {
+		if pc.Timer != nil {
+			pc.Timer.Stop()
+		}
+		delete(h.pendingCalls, targetID)
 	}
 }
 
@@ -178,7 +249,28 @@ func (h *Hub) Run(stop <-chan struct{}) {
 
 			firstConnect := (prevCount == 0)
 			p := h.effectivePresenceLocked(client.userID)
+
+			// Проверяем наличие отложенного входящего вызова для подключившегося абонента
+			var pending *PendingCall
+			if pc, ok := h.pendingCalls[client.userID]; ok && time.Now().Before(pc.ExpiresAt) {
+				pending = pc
+				delete(h.pendingCalls, client.userID)
+				if pc.Timer != nil {
+					pc.Timer.Stop()
+				}
+			}
 			h.mu.Unlock()
+
+			if pending != nil {
+				// Немедленно доставляем WebRTC offer новому подключению адресата
+				client.sendDirect(HubMessage{
+					Type:     "webrtc.signal",
+					ChatID:   pending.ChatID,
+					TopicID:  pending.TopicID,
+					TargetID: pending.CallerID,
+					Payload:  pending.Payload,
+				})
+			}
 
 			if firstConnect {
 				h.BroadcastAll(HubMessage{
@@ -513,22 +605,21 @@ func (c *Client) readPump() {
 		case "webrtc.signal":
 			// Сигналинг WebRTC (SDP offer/answer, ICE candidate, ringing, hangup, reject)
 			if msg.TargetID != "" {
-				// Если это исходящий вызов (offer), а адресат не подключен к WebSocket — сразу сообщаем абоненту
-				if !c.hub.IsUserOnline(msg.TargetID) {
-					if msg.Payload != nil {
-						if sigType, _ := msg.Payload["type"].(string); sigType == "offer" || sigType == "invite" {
-							p := c.hub.GetUserPresence(msg.TargetID)
-							statusLabel := "Абонент не в сети"
-							if p.Status == "vacation" {
-								statusLabel = "Абонент в отпуске"
-								if p.StatusText != "" {
-									statusLabel += " (" + p.StatusText + ")"
-								}
-							} else if p.Status == "busy" {
-								statusLabel = "Абонент занят"
-								if p.StatusText != "" {
-									statusLabel += " (" + p.StatusText + ")"
-								}
+				sigType, _ := msg.Payload["type"].(string)
+
+				// Если звонящий сбросил или отменил вызов
+				if sigType == "hangup" || sigType == "reject" || sigType == "cancel" {
+					c.hub.CancelPendingCall(c.userID, msg.TargetID)
+				}
+
+				// Если это исходящий вызов (offer), а адресат прямо сейчас не в WebSocket
+				if sigType == "offer" || sigType == "invite" {
+					if !c.hub.IsUserOnline(msg.TargetID) {
+						p := c.hub.GetUserPresence(msg.TargetID)
+						if p.Status == "vacation" {
+							statusLabel := "Абонент в отпуске"
+							if p.StatusText != "" {
+								statusLabel += " (" + p.StatusText + ")"
 							}
 							c.sendDirect(HubMessage{
 								Type:     "webrtc.signal",
@@ -537,11 +628,42 @@ func (c *Client) readPump() {
 								Payload: map[string]any{
 									"type":   "offline",
 									"status": statusLabel,
-									"reason": "user_offline",
+									"reason": "user_vacation",
 								},
 							})
 							continue
 						}
+
+						// Ставим звонок в буфер ожидания пробуждения (35 секунд звонкового окна, как в TG)
+						targetID := msg.TargetID
+						chatID := msg.ChatID
+						topicID := msg.TopicID
+						c.hub.CreatePendingCall(c.userID, targetID, chatID, topicID, msg.Payload, 35*time.Second, func() {
+							// По истечении 35 секунд без ответа сообщаем вызывающему абоненту
+							c.sendDirect(HubMessage{
+								Type:     "webrtc.signal",
+								ChatID:   chatID,
+								TopicID:  topicID,
+								TargetID: targetID,
+								Payload: map[string]any{
+									"type":   "offline",
+									"status": "Абонент не ответил (таймаут)",
+									"reason": "call_timeout",
+								},
+							})
+						})
+
+						// Отправляем звонящему статус ringing (звучат длинные гудки)
+						c.sendDirect(HubMessage{
+							Type:     "webrtc.signal",
+							ChatID:   msg.ChatID,
+							TargetID: msg.TargetID,
+							Payload: map[string]any{
+								"type":   "ringing",
+								"status": "Вызов абонента...",
+							},
+						})
+						continue
 					}
 				}
 

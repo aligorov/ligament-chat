@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/aligorov/ligament-chat/internal/contract"
 )
@@ -113,5 +114,46 @@ func TestPresenceAPIHandlers(t *testing.T) {
 	}
 	if len(getRes.Presences) == 0 {
 		t.Fatalf("expected non-empty presences")
+	}
+}
+
+func TestPendingCallLogic(t *testing.T) {
+	hub := NewHub()
+	stop := make(chan struct{})
+	go hub.Run(stop)
+	defer close(stop)
+
+	timeoutFired := false
+	hub.CreatePendingCall("caller1", "target1", "chat1", 0, map[string]any{"type": "offer"}, 100*time.Millisecond, func() {
+		timeoutFired = true
+	})
+
+	hub.mu.RLock()
+	if _, ok := hub.pendingCalls["target1"]; !ok {
+		hub.mu.RUnlock()
+		t.Fatalf("expected pending call for target1")
+	}
+	hub.mu.RUnlock()
+
+	// Отмена вызова
+	hub.CancelPendingCall("caller1", "target1")
+	hub.mu.RLock()
+	if _, ok := hub.pendingCalls["target1"]; ok {
+		hub.mu.RUnlock()
+		t.Fatalf("expected pending call to be cancelled")
+	}
+	hub.mu.RUnlock()
+
+	// Проверка таймаута
+	timedOut := false
+	hub.CreatePendingCall("caller2", "target2", "chat2", 0, map[string]any{"type": "offer"}, 50*time.Millisecond, func() {
+		timedOut = true
+	})
+	time.Sleep(80 * time.Millisecond)
+	if !timedOut {
+		t.Fatalf("expected timeout callback to be invoked")
+	}
+	if timeoutFired {
+		t.Fatalf("cancelled call timeout should not have fired")
 	}
 }
