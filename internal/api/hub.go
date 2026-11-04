@@ -213,6 +213,13 @@ func (h *Hub) BroadcastToRoom(room string, msg HubMessage) {
 	}
 }
 
+// IsUserOnline проверяет, подключен ли пользователь хотя бы одним активным клиентом WebSocket
+func (h *Hub) IsUserOnline(userID string) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return len(h.userClients[userID]) > 0
+}
+
 // SendDirect отправляет событие конкретному пользователю на все его клиенты (P2P сигналинг звонков)
 func (h *Hub) SendDirect(targetUserID string, msg HubMessage) {
 	data, err := json.Marshal(msg)
@@ -338,8 +345,27 @@ func (c *Client) readPump() {
 				})
 			}
 		case "webrtc.signal":
-			// Сигналинг WebRTC (SDP offer/answer, ICE candidate)
+			// Сигналинг WebRTC (SDP offer/answer, ICE candidate, ringing, hangup, reject)
 			if msg.TargetID != "" {
+				// Если это исходящий вызов (offer), а адресат не подключен к WebSocket — сразу сообщаем абоненту
+				if !c.hub.IsUserOnline(msg.TargetID) {
+					if msg.Payload != nil {
+						if sigType, _ := msg.Payload["type"].(string); sigType == "offer" || sigType == "invite" {
+							c.sendDirect(HubMessage{
+								Type:     "webrtc.signal",
+								ChatID:   msg.ChatID,
+								TargetID: msg.TargetID,
+								Payload: map[string]any{
+									"type":   "offline",
+									"status": "Абонент не в сети",
+									"reason": "user_offline",
+								},
+							})
+							continue
+						}
+					}
+				}
+
 				c.hub.SendDirect(msg.TargetID, HubMessage{
 					Type:     "webrtc.signal",
 					ChatID:   msg.ChatID,
@@ -348,6 +374,17 @@ func (c *Client) readPump() {
 				})
 			}
 		}
+	}
+}
+
+func (c *Client) sendDirect(msg HubMessage) {
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return
+	}
+	select {
+	case c.send <- data:
+	default:
 	}
 }
 
