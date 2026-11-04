@@ -1,11 +1,13 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -58,6 +60,7 @@ type Hub struct {
 	roomClients   map[string]map[*Client]bool
 	userPresences map[string]*store.UserPresence
 	pendingCalls  map[string]*PendingCall // targetUserID -> PendingCall
+	coreURL       string
 	register      chan *Client
 	unregister    chan *Client
 	broadcast     chan *broadcastEvent
@@ -212,6 +215,32 @@ func (h *Hub) CancelPendingCall(callerID, targetID string) {
 			pc.Timer.Stop()
 		}
 		delete(h.pendingCalls, targetID)
+	}
+}
+
+// notifyCoreCall уведомляет Core о звонке временно отключенному абоненту для отправки push
+func (h *Hub) notifyCoreCall(callerID, targetID, chatID string, isVideo bool) {
+	h.mu.RLock()
+	coreURL := h.coreURL
+	h.mu.RUnlock()
+
+	if coreURL == "" {
+		return
+	}
+	payload, err := json.Marshal(map[string]any{
+		"caller":      callerID,
+		"target_user": targetID,
+		"chat_id":     chatID,
+		"is_video":    isVideo,
+	})
+	if err != nil {
+		return
+	}
+	endpoint := strings.TrimRight(coreURL, "/") + "/apps/chat/api/v1/internal/notify-call"
+	client := &http.Client{Timeout: 4 * time.Second}
+	resp, err := client.Post(endpoint, "application/json", bytes.NewReader(payload))
+	if err == nil && resp != nil {
+		_ = resp.Body.Close()
 	}
 }
 
@@ -638,6 +667,15 @@ func (c *Client) readPump() {
 						targetID := msg.TargetID
 						chatID := msg.ChatID
 						topicID := msg.TopicID
+
+						isVideo := false
+						if msg.Payload != nil {
+							if iv, ok := msg.Payload["is_video"].(bool); ok {
+								isVideo = iv
+							}
+						}
+						go c.hub.notifyCoreCall(c.userID, targetID, chatID, isVideo)
+
 						c.hub.CreatePendingCall(c.userID, targetID, chatID, topicID, msg.Payload, 35*time.Second, func() {
 							// По истечении 35 секунд без ответа сообщаем вызывающему абоненту
 							c.sendDirect(HubMessage{

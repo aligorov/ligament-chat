@@ -24,6 +24,11 @@ func NewServer(st *store.Store, hub *Hub, dataDir, recorderURL, coreURL string) 
 		recorderURL: recorderURL,
 		coreURL:     coreURL,
 	}
+	if hub != nil {
+		hub.mu.Lock()
+		hub.coreURL = coreURL
+		hub.mu.Unlock()
+	}
 
 	s.routes()
 	return s
