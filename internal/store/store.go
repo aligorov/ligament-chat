@@ -899,3 +899,78 @@ func IsUniqueViolation(err error) bool {
 	}
 	return false
 }
+
+// GetUserPresence возвращает сохранённый статус пользователя.
+func (s *Store) GetUserPresence(ctx context.Context, userID string) (*UserPresence, error) {
+	if s == nil || s.pool == nil {
+		return nil, fmt.Errorf("store: nil pool")
+	}
+	var p UserPresence
+	err := s.pool.QueryRow(ctx, `
+		SELECT user_id, status, status_text, updated_at
+		FROM user_presence
+		WHERE user_id = $1
+	`, userID).Scan(&p.UserID, &p.Status, &p.StatusText, &p.UpdatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return &UserPresence{
+			UserID:    userID,
+			Status:    "online",
+			UpdatedAt: time.Now().UTC(),
+		}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
+// SetUserPresence обновляет или вставляет статус пользователя.
+func (s *Store) SetUserPresence(ctx context.Context, userID, status, statusText string) (*UserPresence, error) {
+	if s == nil || s.pool == nil {
+		return nil, fmt.Errorf("store: nil pool")
+	}
+	status = strings.TrimSpace(status)
+	if status == "" {
+		status = "online"
+	}
+	now := time.Now().UTC()
+	var p UserPresence
+	err := s.pool.QueryRow(ctx, `
+		INSERT INTO user_presence (user_id, status, status_text, updated_at)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (user_id) DO UPDATE
+		SET status = EXCLUDED.status,
+		    status_text = EXCLUDED.status_text,
+		    updated_at = EXCLUDED.updated_at
+		RETURNING user_id, status, status_text, updated_at
+	`, userID, status, strings.TrimSpace(statusText), now).Scan(&p.UserID, &p.Status, &p.StatusText, &p.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
+// ListUserPresences загружает все сохранённые пользовательские статусы.
+func (s *Store) ListUserPresences(ctx context.Context) (map[string]*UserPresence, error) {
+	if s == nil || s.pool == nil {
+		return nil, fmt.Errorf("store: nil pool")
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT user_id, status, status_text, updated_at
+		FROM user_presence
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make(map[string]*UserPresence)
+	for rows.Next() {
+		var p UserPresence
+		if err := rows.Scan(&p.UserID, &p.Status, &p.StatusText, &p.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out[p.UserID] = &p
+	}
+	return out, rows.Err()
+}

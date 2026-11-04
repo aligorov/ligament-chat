@@ -68,6 +68,11 @@ func (s *Server) routes() {
 	// Attachments
 	s.mux.Handle("POST /api/v1/attachments/upload", s.authMiddleware(http.HandlerFunc(s.handleUploadAttachment)))
 	s.mux.Handle("GET /api/v1/attachments/{id}/download", s.authMiddleware(http.HandlerFunc(s.handleDownloadAttachment)))
+
+	// Presence & Statuses
+	s.mux.Handle("GET /api/v1/presence", s.authMiddleware(http.HandlerFunc(s.handleGetPresence)))
+	s.mux.Handle("PUT /api/v1/presence", s.authMiddleware(http.HandlerFunc(s.handleUpdatePresence)))
+	s.mux.Handle("POST /api/v1/presence", s.authMiddleware(http.HandlerFunc(s.handleUpdatePresence)))
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {

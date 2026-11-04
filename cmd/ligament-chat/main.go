@@ -77,7 +77,7 @@ func main() {
 	cancel()
 	slog.Info("connected to postgres and verified schema migrations")
 
-	hub := api.NewHub()
+	hub := api.NewHub(st)
 	stopHub := make(chan struct{})
 	go hub.Run(stopHub)
 

@@ -129,3 +129,12 @@ type CallSession struct {
 	EndedAt           *time.Time `json:"ended_at,omitempty"`
 	CreatedAt         time.Time  `json:"created_at"`
 }
+
+// UserPresence хранит статус присутствия сотрудника в чате (онлайн, занят, в отпуске и др.)
+type UserPresence struct {
+	UserID     string    `json:"user_id"`
+	Status     string    `json:"status"` // online, busy, vacation, away, dnd, offline
+	StatusText string    `json:"status_text"`
+	IsOnline   bool      `json:"is_online"`
+	UpdatedAt  time.Time `json:"updated_at"`
+}

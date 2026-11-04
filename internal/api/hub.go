@@ -51,14 +51,16 @@ type Client struct {
 }
 
 type Hub struct {
-	mu          sync.RWMutex
-	clients     map[*Client]bool
-	userClients map[string]map[*Client]bool
-	roomClients map[string]map[*Client]bool
-	register    chan *Client
-	unregister  chan *Client
-	broadcast   chan *broadcastEvent
-	direct      chan *directEvent
+	mu            sync.RWMutex
+	st            *store.Store
+	clients       map[*Client]bool
+	userClients   map[string]map[*Client]bool
+	roomClients   map[string]map[*Client]bool
+	userPresences map[string]*store.UserPresence
+	register      chan *Client
+	unregister    chan *Client
+	broadcast     chan *broadcastEvent
+	direct        chan *directEvent
 }
 
 type broadcastEvent struct {
@@ -71,15 +73,36 @@ type directEvent struct {
 	data         []byte
 }
 
-func NewHub() *Hub {
-	return &Hub{
-		clients:     make(map[*Client]bool),
-		userClients: make(map[string]map[*Client]bool),
-		roomClients: make(map[string]map[*Client]bool),
-		register:    make(chan *Client),
-		unregister:  make(chan *Client),
-		broadcast:   make(chan *broadcastEvent, 256),
-		direct:      make(chan *directEvent, 256),
+func NewHub(st ...*store.Store) *Hub {
+	h := &Hub{
+		clients:       make(map[*Client]bool),
+		userClients:   make(map[string]map[*Client]bool),
+		roomClients:   make(map[string]map[*Client]bool),
+		userPresences: make(map[string]*store.UserPresence),
+		register:      make(chan *Client),
+		unregister:    make(chan *Client),
+		broadcast:     make(chan *broadcastEvent, 256),
+		direct:        make(chan *directEvent, 256),
+	}
+	if len(st) > 0 && st[0] != nil {
+		h.st = st[0]
+		if list, err := h.st.ListUserPresences(context.Background()); err == nil {
+			h.userPresences = list
+		}
+	}
+	return h
+}
+
+func (h *Hub) SetStore(st *store.Store) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.st = st
+	if st != nil {
+		if list, err := st.ListUserPresences(context.Background()); err == nil {
+			for k, v := range list {
+				h.userPresences[k] = v
+			}
+		}
 	}
 }
 
@@ -142,6 +165,7 @@ func (h *Hub) Run(stop <-chan struct{}) {
 			if _, ok := h.userClients[client.userID]; !ok {
 				h.userClients[client.userID] = make(map[*Client]bool)
 			}
+			prevCount := len(h.userClients[client.userID])
 			h.userClients[client.userID][client] = true
 			userRoom := "user:" + client.userID
 			if _, ok := h.roomClients[userRoom]; !ok {
@@ -151,12 +175,35 @@ func (h *Hub) Run(stop <-chan struct{}) {
 			client.roomsMu.Lock()
 			client.rooms[userRoom] = true
 			client.roomsMu.Unlock()
+
+			firstConnect := (prevCount == 0)
+			p := h.effectivePresenceLocked(client.userID)
 			h.mu.Unlock()
+
+			if firstConnect {
+				h.BroadcastAll(HubMessage{
+					Type: "presence.update",
+					Payload: map[string]any{
+						"presence": p,
+					},
+				})
+			}
 
 		case client := <-h.unregister:
 			h.mu.Lock()
 			h.unregisterClientLocked(client)
+			userLeft := (len(h.userClients[client.userID]) == 0)
+			p := h.effectivePresenceLocked(client.userID)
 			h.mu.Unlock()
+
+			if userLeft {
+				h.BroadcastAll(HubMessage{
+					Type: "presence.update",
+					Payload: map[string]any{
+						"presence": p,
+					},
+				})
+			}
 
 		case ev := <-h.broadcast:
 			h.mu.RLock()
@@ -232,6 +279,114 @@ func (h *Hub) SendDirect(targetUserID string, msg HubMessage) {
 	}
 }
 
+// BroadcastAll рассылает сообщение всем подключенным клиентам чата
+func (h *Hub) BroadcastAll(msg HubMessage) {
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return
+	}
+	h.mu.RLock()
+	var deadClients []*Client
+	for client := range h.clients {
+		select {
+		case client.send <- data:
+		default:
+			deadClients = append(deadClients, client)
+		}
+	}
+	h.mu.RUnlock()
+
+	if len(deadClients) > 0 {
+		h.mu.Lock()
+		for _, client := range deadClients {
+			h.unregisterClientLocked(client)
+		}
+		h.mu.Unlock()
+	}
+}
+
+func (h *Hub) effectivePresenceLocked(userID string) store.UserPresence {
+	isOnline := len(h.userClients[userID]) > 0
+	custom, ok := h.userPresences[userID]
+	if ok && custom != nil {
+		p := *custom
+		p.IsOnline = isOnline
+		if p.Status == "" {
+			if isOnline {
+				p.Status = "online"
+			} else {
+				p.Status = "offline"
+			}
+		}
+		return p
+	}
+
+	st := "offline"
+	if isOnline {
+		st = "online"
+	}
+	return store.UserPresence{
+		UserID:    userID,
+		Status:    st,
+		IsOnline:  isOnline,
+		UpdatedAt: time.Now().UTC(),
+	}
+}
+
+// UpdateUserPresence обновляет статус сотрудника (в сети, занят, в отпуске и др.)
+func (h *Hub) UpdateUserPresence(ctx context.Context, userID, status, statusText string) store.UserPresence {
+	h.mu.Lock()
+	if h.st != nil {
+		_, _ = h.st.SetUserPresence(ctx, userID, status, statusText)
+	}
+	now := time.Now().UTC()
+	h.userPresences[userID] = &store.UserPresence{
+		UserID:     userID,
+		Status:     status,
+		StatusText: statusText,
+		UpdatedAt:  now,
+	}
+	p := h.effectivePresenceLocked(userID)
+	h.mu.Unlock()
+
+	h.BroadcastAll(HubMessage{
+		Type: "presence.update",
+		Payload: map[string]any{
+			"presence": p,
+		},
+	})
+	return p
+}
+
+// GetPresencesSnapshot возвращает снимок статусов всех пользователей
+func (h *Hub) GetPresencesSnapshot() []store.UserPresence {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	allUsers := make(map[string]bool)
+	for u := range h.userClients {
+		if len(h.userClients[u]) > 0 {
+			allUsers[u] = true
+		}
+	}
+	for u := range h.userPresences {
+		allUsers[u] = true
+	}
+
+	res := make([]store.UserPresence, 0, len(allUsers))
+	for u := range allUsers {
+		res = append(res, h.effectivePresenceLocked(u))
+	}
+	return res
+}
+
+// GetUserPresence возвращает текущий статус сотрудника
+func (h *Hub) GetUserPresence(userID string) store.UserPresence {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.effectivePresenceLocked(userID)
+}
+
 func (c *Client) readPump() {
 	defer func() {
 		c.hub.unregister <- c
@@ -259,6 +414,17 @@ func (c *Client) readPump() {
 		}
 
 		switch msg.Type {
+		case "presence.set":
+			var req struct {
+				Status     string `json:"status"`
+				StatusText string `json:"status_text"`
+			}
+			if msg.Payload != nil {
+				if b, err := json.Marshal(msg.Payload); err == nil {
+					_ = json.Unmarshal(b, &req)
+				}
+			}
+			c.hub.UpdateUserPresence(context.Background(), c.userID, req.Status, req.StatusText)
 		case "room.join":
 			if msg.ChatID != "" {
 				chatID, err := uuid.Parse(msg.ChatID)
@@ -351,13 +517,26 @@ func (c *Client) readPump() {
 				if !c.hub.IsUserOnline(msg.TargetID) {
 					if msg.Payload != nil {
 						if sigType, _ := msg.Payload["type"].(string); sigType == "offer" || sigType == "invite" {
+							p := c.hub.GetUserPresence(msg.TargetID)
+							statusLabel := "Абонент не в сети"
+							if p.Status == "vacation" {
+								statusLabel = "Абонент в отпуске"
+								if p.StatusText != "" {
+									statusLabel += " (" + p.StatusText + ")"
+								}
+							} else if p.Status == "busy" {
+								statusLabel = "Абонент занят"
+								if p.StatusText != "" {
+									statusLabel += " (" + p.StatusText + ")"
+								}
+							}
 							c.sendDirect(HubMessage{
 								Type:     "webrtc.signal",
 								ChatID:   msg.ChatID,
 								TargetID: msg.TargetID,
 								Payload: map[string]any{
 									"type":   "offline",
-									"status": "Абонент не в сети",
+									"status": statusLabel,
 									"reason": "user_offline",
 								},
 							})
@@ -462,6 +641,20 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.hub.register <- client
+
+	// Сразу отправляем текущий снимок присутствия подключившемуся клиенту
+	snapshot := s.hub.GetPresencesSnapshot()
+	if b, err := json.Marshal(HubMessage{
+		Type: "presence.snapshot",
+		Payload: map[string]any{
+			"presences": snapshot,
+		},
+	}); err == nil {
+		select {
+		case client.send <- b:
+		default:
+		}
+	}
 
 	// Если передан last_message_id, досылаем пропущенные клиентом сообщения
 	if lastMsgID > 0 {
