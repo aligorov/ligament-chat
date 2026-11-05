@@ -86,6 +86,7 @@ type broadcastEvent struct {
 
 type directEvent struct {
 	targetUserID string
+	exceptClient *Client
 	data         []byte
 }
 
@@ -350,6 +351,9 @@ func (h *Hub) Run(stop <-chan struct{}) {
 			h.mu.RLock()
 			var deadClients []*Client
 			for client := range h.userClients[ev.targetUserID] {
+				if ev.exceptClient != nil && client == ev.exceptClient {
+					continue
+				}
 				select {
 				case client.send <- ev.data:
 				default:
@@ -388,6 +392,13 @@ func (h *Hub) IsUserOnline(userID string) bool {
 	return len(h.userClients[userID]) > 0
 }
 
+// UserClientCount возвращает количество активных подключений пользователя
+func (h *Hub) UserClientCount(userID string) int {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return len(h.userClients[userID])
+}
+
 // SendDirect отправляет событие конкретному пользователю на все его клиенты (P2P сигналинг звонков)
 func (h *Hub) SendDirect(targetUserID string, msg HubMessage) {
 	data, err := json.Marshal(msg)
@@ -396,6 +407,19 @@ func (h *Hub) SendDirect(targetUserID string, msg HubMessage) {
 	}
 	h.direct <- &directEvent{
 		targetUserID: targetUserID,
+		data:         data,
+	}
+}
+
+// SendToUserExcept отправляет событие всем клиентам пользователя, кроме указанного (c)
+func (h *Hub) SendToUserExcept(targetUserID string, except *Client, msg HubMessage) {
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return
+	}
+	h.direct <- &directEvent{
+		targetUserID: targetUserID,
+		exceptClient: except,
 		data:         data,
 	}
 }
@@ -701,6 +725,75 @@ func (c *Client) readPump() {
 								"status": "Вызов абонента...",
 							},
 						})
+						continue
+					}
+				}
+
+				if sigType == "answer" {
+					c.hub.SendDirect(msg.TargetID, HubMessage{
+						Type:     "webrtc.signal",
+						ChatID:   msg.ChatID,
+						TargetID: c.userID,
+						Payload:  msg.Payload,
+					})
+					// Всем остальным устройствам ответившего абонента шлём отмену (answered_elsewhere)
+					c.hub.SendToUserExcept(c.userID, c, HubMessage{
+						Type:     "webrtc.signal",
+						ChatID:   msg.ChatID,
+						TargetID: msg.TargetID,
+						Payload: map[string]any{
+							"type":   "cancel",
+							"reason": "answered_elsewhere",
+						},
+					})
+					continue
+				}
+
+				if sigType == "reject" || sigType == "rejected" {
+					c.hub.CancelPendingCall(c.userID, msg.TargetID)
+					c.hub.SendDirect(msg.TargetID, HubMessage{
+						Type:     "webrtc.signal",
+						ChatID:   msg.ChatID,
+						TargetID: c.userID,
+						Payload:  msg.Payload,
+					})
+					// Всем остальным устройствам отклонившего абонента шлём отмену (declined_elsewhere)
+					c.hub.SendToUserExcept(c.userID, c, HubMessage{
+						Type:     "webrtc.signal",
+						ChatID:   msg.ChatID,
+						TargetID: msg.TargetID,
+						Payload: map[string]any{
+							"type":   "cancel",
+							"reason": "declined_elsewhere",
+						},
+					})
+					continue
+				}
+
+				if sigType == "hangup" || sigType == "cancel" {
+					c.hub.CancelPendingCall(c.userID, msg.TargetID)
+					c.hub.SendDirect(msg.TargetID, HubMessage{
+						Type:     "webrtc.signal",
+						ChatID:   msg.ChatID,
+						TargetID: c.userID,
+						Payload:  msg.Payload,
+					})
+					c.hub.SendToUserExcept(c.userID, c, HubMessage{
+						Type:     "webrtc.signal",
+						ChatID:   msg.ChatID,
+						TargetID: msg.TargetID,
+						Payload: map[string]any{
+							"type":   "cancel",
+							"reason": "canceled_by_caller",
+						},
+					})
+					continue
+				}
+
+				if sigType == "busy" {
+					// Если у пользователя несколько устройств, не сбрасываем звонок для звонящего сразу:
+					// другие устройства могут быть свободны и звонить
+					if c.hub.UserClientCount(c.userID) > 1 {
 						continue
 					}
 				}
