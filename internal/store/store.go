@@ -1200,3 +1200,101 @@ func (s *Store) ListUserPresences(ctx context.Context) (map[string]*UserPresence
 	}
 	return out, rows.Err()
 }
+
+// GetChatMemberUserIDs возвращает список идентификаторов всех участников чата.
+func (s *Store) GetChatMemberUserIDs(ctx context.Context, chatID uuid.UUID) ([]string, error) {
+	if s == nil || s.pool == nil {
+		return nil, fmt.Errorf("store: nil pool")
+	}
+	rows, err := s.pool.Query(ctx, `SELECT user_id FROM chat_members WHERE chat_id = $1`, chatID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var members []string
+	for rows.Next() {
+		var uid string
+		if err := rows.Scan(&uid); err != nil {
+			return nil, err
+		}
+		members = append(members, uid)
+	}
+	return members, rows.Err()
+}
+
+// GetUsersWithUnreadMessages возвращает список пользователей с непрочитанными сообщениями и сниппетом последнего сообщения.
+func (s *Store) GetUsersWithUnreadMessages(ctx context.Context) ([]UnreadUserSummary, error) {
+	if s == nil || s.pool == nil {
+		return nil, fmt.Errorf("store: nil pool")
+	}
+
+	query := `
+		SELECT 
+		    cm.user_id,
+		    COUNT(m.id) AS total_unread,
+		    COUNT(DISTINCT m.chat_id) AS chats_count,
+		    COALESCE(MAX(m.id), 0) AS max_message_id,
+		    COALESCE(MAX(m.created_at), NOW()) AS last_message_at
+		FROM chat_members cm
+		JOIN chats c ON c.id = cm.chat_id AND c.is_archived = FALSE
+		JOIN messages m ON m.chat_id = c.id AND m.deleted_at IS NULL AND m.sender_id != cm.user_id
+		LEFT JOIN topic_participants tp ON tp.chat_id = m.chat_id AND tp.topic_id = m.topic_id AND tp.user_id = cm.user_id
+		WHERE m.id > COALESCE(tp.last_read_message_id, 0)
+		GROUP BY cm.user_id
+		HAVING COUNT(m.id) > 0
+	`
+
+	rows, err := s.pool.Query(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var summaries []UnreadUserSummary
+	for rows.Next() {
+		var u UnreadUserSummary
+		if err := rows.Scan(&u.UserID, &u.TotalUnread, &u.ChatsCount, &u.MaxMessageID, &u.LastMessageAt); err != nil {
+			return nil, err
+		}
+		summaries = append(summaries, u)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Дополняем сниппетом последнего сообщения
+	for i := range summaries {
+		if summaries[i].MaxMessageID <= 0 {
+			continue
+		}
+		var chatID uuid.UUID
+		var chatTitle, senderName, body string
+		snippetQuery := `
+			SELECT m.chat_id,
+			       CASE 
+			           WHEN c.kind = 'direct' THEN COALESCE(
+			               NULLIF((SELECT cm_peer.display_name FROM chat_members cm_peer WHERE cm_peer.chat_id = c.id AND cm_peer.user_id != $2 LIMIT 1), ''),
+			               NULLIF((SELECT cm_peer.user_id FROM chat_members cm_peer WHERE cm_peer.chat_id = c.id AND cm_peer.user_id != $2 LIMIT 1), ''),
+			               c.title
+			           )
+			           ELSE c.title 
+			       END AS chat_title,
+			       m.sender_name,
+			       m.body
+			FROM messages m
+			JOIN chats c ON c.id = m.chat_id
+			WHERE m.id = $1
+		`
+		sErr := s.pool.QueryRow(ctx, snippetQuery, summaries[i].MaxMessageID, summaries[i].UserID).
+			Scan(&chatID, &chatTitle, &senderName, &body)
+		if sErr == nil {
+			summaries[i].ChatID = chatID
+			summaries[i].ChatTitle = chatTitle
+			summaries[i].SenderName = senderName
+			summaries[i].MessageBody = body
+		}
+	}
+
+	return summaries, nil
+}

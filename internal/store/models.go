@@ -147,3 +147,16 @@ type UserPresence struct {
 	IsOnline   bool      `json:"is_online"`
 	UpdatedAt  time.Time `json:"updated_at"`
 }
+
+// UnreadUserSummary содержит агрегированные данные о непрочитанных сообщениях пользователя для push-напоминаний.
+type UnreadUserSummary struct {
+	UserID        string    `json:"user_id"`
+	TotalUnread   int       `json:"total_unread"`
+	ChatsCount    int       `json:"chats_count"`
+	MaxMessageID  int64     `json:"max_message_id"`
+	LastMessageAt time.Time `json:"last_message_at"`
+	ChatID        uuid.UUID `json:"chat_id"`
+	ChatTitle     string    `json:"chat_title"`
+	SenderName    string    `json:"sender_name"`
+	MessageBody   string    `json:"message_body"`
+}

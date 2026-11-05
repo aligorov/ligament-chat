@@ -1,11 +1,13 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/aligorov/ligament-chat/internal/contract"
 	"github.com/aligorov/ligament-chat/internal/store"
@@ -505,6 +507,25 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 			"message": msg,
 		},
 	})
+
+	// Асинхронно уведомляем Core для отправки мгновенного push офлайн-участникам
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		members, err := s.st.GetChatMemberUserIDs(ctx, chatID)
+		if err != nil || len(members) == 0 {
+			return
+		}
+		roomName := "chat:" + chatID.String()
+		for _, memberID := range members {
+			if memberID == userID {
+				continue
+			}
+			if !s.hub.IsUserInRoom(roomName, memberID) {
+				s.hub.notifyCoreMessage(memberID, chatID.String(), senderName, senderName, msg.Body)
+			}
+		}
+	}()
 
 	writeJSON(w, http.StatusCreated, msg)
 }

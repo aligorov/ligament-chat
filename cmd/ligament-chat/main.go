@@ -17,7 +17,7 @@ import (
 )
 
 var (
-	Version   = "v0.1.17"
+	Version   = "v0.1.18"
 	BuildDate = "2026-11-05"
 )
 
@@ -30,7 +30,22 @@ func main() {
 	dbConnStr := flag.String("db-conn", "", "Explicit PostgreSQL connection string (overrides socket)")
 	recorderURL := flag.String("recorder-url", "http://127.0.0.1:8095", "Ligament Recorder base URL")
 	coreURL := flag.String("core-url", "http://127.0.0.1:8080", "Ligament 2FA Core base URL")
+	unreadInterval := flag.Duration("unread-reminder-interval", 15*time.Minute, "Periodic interval for unread message reminder push")
+	unreadMinAge := flag.Duration("unread-min-age", 3*time.Minute, "Minimum age of unread message before sending reminder")
 	flag.Parse()
+
+	resolvedUnreadInterval := *unreadInterval
+	if envInterval := os.Getenv("UNREAD_REMINDER_INTERVAL"); envInterval != "" {
+		if d, err := time.ParseDuration(envInterval); err == nil && d > 0 {
+			resolvedUnreadInterval = d
+		}
+	}
+	resolvedUnreadMinAge := *unreadMinAge
+	if envMinAge := os.Getenv("UNREAD_MIN_AGE"); envMinAge != "" {
+		if d, err := time.ParseDuration(envMinAge); err == nil && d > 0 {
+			resolvedUnreadMinAge = d
+		}
+	}
 
 	resolvedCore := *coreURL
 	if envCore := os.Getenv("CORE_URL"); envCore != "" && *coreURL == "http://127.0.0.1:8080" {
@@ -92,6 +107,9 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	unreadWorker := api.NewUnreadReminderWorker(srv, resolvedUnreadInterval, resolvedUnreadMinAge)
+	go unreadWorker.Run(ctx)
 
 	go func() {
 		slog.Info("chat server listening", "addr", *listenAddr)

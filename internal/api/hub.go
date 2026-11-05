@@ -245,6 +245,78 @@ func (h *Hub) notifyCoreCall(callerID, targetID, chatID string, isVideo bool) {
 	}
 }
 
+// notifyCoreUnread уведомляет Core о наличии непрочитанных сообщений у пользователя (периодический воркер-напоминатель).
+func (h *Hub) notifyCoreUnread(targetUser string, totalUnread, chatsCount int, chatID, chatTitle, senderName, lastMessage string) {
+	h.mu.RLock()
+	coreURL := h.coreURL
+	h.mu.RUnlock()
+
+	if coreURL == "" {
+		return
+	}
+	payload, err := json.Marshal(map[string]any{
+		"target_user":  targetUser,
+		"total_unread": totalUnread,
+		"chats_count":  chatsCount,
+		"chat_id":      chatID,
+		"chat_title":   chatTitle,
+		"sender_name":  senderName,
+		"last_message": lastMessage,
+	})
+	if err != nil {
+		return
+	}
+	endpoint := strings.TrimRight(coreURL, "/") + "/apps/chat/api/v1/internal/notify-unread"
+	client := &http.Client{Timeout: 4 * time.Second}
+	resp, err := client.Post(endpoint, "application/json", bytes.NewReader(payload))
+	if err == nil && resp != nil {
+		_ = resp.Body.Close()
+	}
+}
+
+// notifyCoreMessage отправляет мгновенное уведомление в Core при отправке сообщения офлайн-участнику.
+func (h *Hub) notifyCoreMessage(targetUser, chatID, chatTitle, senderName, messageBody string) {
+	h.mu.RLock()
+	coreURL := h.coreURL
+	h.mu.RUnlock()
+
+	if coreURL == "" {
+		return
+	}
+	payload, err := json.Marshal(map[string]any{
+		"target_user":  targetUser,
+		"chat_id":      chatID,
+		"chat_title":   chatTitle,
+		"sender_name":  senderName,
+		"message_body": messageBody,
+	})
+	if err != nil {
+		return
+	}
+	endpoint := strings.TrimRight(coreURL, "/") + "/apps/chat/api/v1/internal/notify-message"
+	client := &http.Client{Timeout: 4 * time.Second}
+	resp, err := client.Post(endpoint, "application/json", bytes.NewReader(payload))
+	if err == nil && resp != nil {
+		_ = resp.Body.Close()
+	}
+}
+
+// IsUserInRoom проверяет, находится ли пользователь прямо сейчас в комнате (например chat:<id>)
+func (h *Hub) IsUserInRoom(room, userID string) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	clients, ok := h.roomClients[room]
+	if !ok {
+		return false
+	}
+	for c := range clients {
+		if c.userID == userID {
+			return true
+		}
+	}
+	return false
+}
+
 func (h *Hub) Run(stop <-chan struct{}) {
 	for {
 		select {
