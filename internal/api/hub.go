@@ -69,14 +69,15 @@ type Hub struct {
 
 // PendingCall представляет отложенный входящий вызов (когда адресат временно не в сети / в фоне)
 type PendingCall struct {
-	CallerID  string
-	TargetID  string
-	ChatID    string
-	TopicID   int64
-	Payload   map[string]any
-	CreatedAt time.Time
-	ExpiresAt time.Time
-	Timer     *time.Timer
+	CallerID   string
+	TargetID   string
+	ChatID     string
+	TopicID    int64
+	Payload    map[string]any
+	Candidates []map[string]any
+	CreatedAt  time.Time
+	ExpiresAt  time.Time
+	Timer      *time.Timer
 }
 
 type broadcastEvent struct {
@@ -217,6 +218,17 @@ func (h *Hub) CancelPendingCall(callerID, targetID string) {
 		}
 		delete(h.pendingCalls, targetID)
 	}
+}
+
+// AddPendingCallCandidate буферизует ICE-кандидат для ожидающего звонка, пока абонент просыпается
+func (h *Hub) AddPendingCallCandidate(callerID, targetID string, payload map[string]any) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if pc, ok := h.pendingCalls[targetID]; ok && pc.CallerID == callerID {
+		pc.Candidates = append(pc.Candidates, payload)
+		return true
+	}
+	return false
 }
 
 // notifyCoreCall уведомляет Core о звонке временно отключенному абоненту для отправки push
@@ -372,6 +384,16 @@ func (h *Hub) Run(stop <-chan struct{}) {
 					TargetID: pending.CallerID,
 					Payload:  pending.Payload,
 				})
+				// Досылаем все накопленные ранние ICE-кандидаты от звонящего
+				for _, cand := range pending.Candidates {
+					client.sendDirect(HubMessage{
+						Type:     "webrtc.signal",
+						ChatID:   pending.ChatID,
+						TopicID:  pending.TopicID,
+						TargetID: pending.CallerID,
+						Payload:  cand,
+					})
+				}
 			}
 
 			if firstConnect {
@@ -729,6 +751,24 @@ func (c *Client) readPump() {
 			}
 		case "webrtc.signal":
 			// Сигналинг WebRTC (SDP offer/answer, ICE candidate, ringing, hangup, reject)
+			if msg.ChatID != "" {
+				chatID, err := uuid.Parse(msg.ChatID)
+				if err == nil && c.st != nil {
+					var groups []string
+					var dept, role string
+					if c.claims != nil {
+						groups = c.claims.ADGroups
+						dept = c.claims.Department
+						role = c.claims.Role
+					}
+					ok, _, aErr := c.st.CanAccessChat(context.Background(), chatID, c.userID, groups, dept, role)
+					if aErr != nil || !ok {
+						slog.Warn("ws.webrtc_signal_denied", "chat_id", msg.ChatID, "user_id", c.userID)
+						continue
+					}
+				}
+			}
+
 			if msg.TargetID != "" {
 				sigType, _ := msg.Payload["type"].(string)
 
@@ -737,40 +777,49 @@ func (c *Client) readPump() {
 					c.hub.CancelPendingCall(c.userID, msg.TargetID)
 				}
 
-				// Если это исходящий вызов (offer), а адресат прямо сейчас не в WebSocket
-				if sigType == "offer" || sigType == "invite" {
-					if !c.hub.IsUserOnline(msg.TargetID) {
-						p := c.hub.GetUserPresence(msg.TargetID)
-						if p.Status == "vacation" {
-							statusLabel := "Абонент в отпуске"
-							if p.StatusText != "" {
-								statusLabel += " (" + p.StatusText + ")"
-							}
-							c.sendDirect(HubMessage{
-								Type:     "webrtc.signal",
-								ChatID:   msg.ChatID,
-								TargetID: msg.TargetID,
-								Payload: map[string]any{
-									"type":   "offline",
-									"status": statusLabel,
-									"reason": "user_vacation",
-								},
-							})
-							continue
-						}
+				// Если это ICE кандидат (или пачка кандидатов), а адресат еще ожидает пробуждения/подключения
+				if sigType == "candidate" || sigType == "candidates" {
+					if c.hub.AddPendingCallCandidate(c.userID, msg.TargetID, msg.Payload) {
+						continue
+					}
+				}
 
+				// Если это исходящий вызов (offer)
+				if sigType == "offer" || sigType == "invite" {
+					p := c.hub.GetUserPresence(msg.TargetID)
+					if p.Status == "vacation" {
+						statusLabel := "Абонент в отпуске"
+						if p.StatusText != "" {
+							statusLabel += " (" + p.StatusText + ")"
+						}
+						c.sendDirect(HubMessage{
+							Type:     "webrtc.signal",
+							ChatID:   msg.ChatID,
+							TargetID: msg.TargetID,
+							Payload: map[string]any{
+								"type":   "offline",
+								"status": statusLabel,
+								"reason": "user_vacation",
+							},
+						})
+						continue
+					}
+
+					isVideo := false
+					if msg.Payload != nil {
+						if iv, ok := msg.Payload["is_video"].(bool); ok {
+							isVideo = iv
+						}
+					}
+					// Всегда оповещаем Core для отправки push на мобильные устройства абонента
+					// (для мультидевайсного вызова, даже если один клиент активен на десктопе)
+					go c.hub.notifyCoreCall(c.userID, msg.TargetID, msg.ChatID, isVideo)
+
+					if !c.hub.IsUserOnline(msg.TargetID) {
 						// Ставим звонок в буфер ожидания пробуждения (35 секунд звонкового окна, как в TG)
 						targetID := msg.TargetID
 						chatID := msg.ChatID
 						topicID := msg.TopicID
-
-						isVideo := false
-						if msg.Payload != nil {
-							if iv, ok := msg.Payload["is_video"].(bool); ok {
-								isVideo = iv
-							}
-						}
-						go c.hub.notifyCoreCall(c.userID, targetID, chatID, isVideo)
 
 						c.hub.CreatePendingCall(c.userID, targetID, chatID, topicID, msg.Payload, 35*time.Second, func() {
 							// По истечении 35 секунд без ответа сообщаем вызывающему абоненту
@@ -908,20 +957,7 @@ func (c *Client) writePump() {
 				return
 			}
 
-			w, err := c.conn.NextWriter(websocket.TextMessage)
-			if err != nil {
-				return
-			}
-			_, _ = w.Write(message)
-
-			// Если в очереди есть еще сообщения, сбрасываем в тот же фрейм
-			n := len(c.send)
-			for i := 0; i < n; i++ {
-				_, _ = w.Write([]byte{'\n'})
-				_, _ = w.Write(<-c.send)
-			}
-
-			if err := w.Close(); err != nil {
+			if err := c.conn.WriteMessage(websocket.TextMessage, message); err != nil {
 				return
 			}
 		case <-ticker.C:
