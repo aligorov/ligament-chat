@@ -63,6 +63,8 @@ func (s *Server) routes() {
 	s.mux.Handle("POST /api/v1/chats/{id}/topics", s.authMiddleware(http.HandlerFunc(s.handleCreateTopic)))
 	s.mux.Handle("GET /api/v1/chats/{id}/messages", s.authMiddleware(http.HandlerFunc(s.handleListMessages)))
 	s.mux.Handle("POST /api/v1/chats/{id}/messages", s.authMiddleware(http.HandlerFunc(s.handleSendMessage)))
+	s.mux.Handle("PUT /api/v1/chats/{id}/messages/{msg_id}", s.authMiddleware(http.HandlerFunc(s.handleEditMessage)))
+	s.mux.Handle("DELETE /api/v1/chats/{id}/messages/{msg_id}", s.authMiddleware(http.HandlerFunc(s.handleDeleteMessage)))
 	s.mux.Handle("POST /api/v1/chats/{id}/read", s.authMiddleware(http.HandlerFunc(s.handleReadPointer)))
 
 	// WebRTC Calls

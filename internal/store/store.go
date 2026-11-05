@@ -20,6 +20,19 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+var (
+	ErrForbidden       = errors.New("forbidden")
+	ErrMessageNotFound = errors.New("message not found")
+	ErrCannotEdit      = errors.New("cannot edit message")
+)
+
+func derefString(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}
+
 type Store struct {
 	pool *pgxpool.Pool
 }
@@ -514,6 +527,18 @@ func (s *Store) SendMessage(ctx context.Context, msg *Message, attachmentIDs []u
 		`, msg.ChatID, msg.SenderID, msg.SenderName)
 	}
 
+	// Подтягиваем превью цитируемого сообщения
+	if msg.ReplyToID != nil && *msg.ReplyToID > 0 {
+		var r ReplyPreview
+		if rErr := s.pool.QueryRow(ctx, `
+			SELECT id, sender_id, sender_name, body
+			FROM messages
+			WHERE id = $1 AND chat_id = $2 AND deleted_at IS NULL
+		`, *msg.ReplyToID, msg.ChatID).Scan(&r.ID, &r.SenderID, &r.SenderName, &r.Body); rErr == nil {
+			msg.ReplyTo = &r
+		}
+	}
+
 	// Обновляем updated_at у чата и топика
 	_, _ = s.pool.Exec(ctx, `UPDATE chats SET updated_at = NOW() WHERE id = $1`, msg.ChatID)
 	if msg.TopicID > 0 {
@@ -524,7 +549,8 @@ func (s *Store) SendMessage(ctx context.Context, msg *Message, attachmentIDs []u
 }
 
 // ListMessages возвращает сообщения чата/топика до указанного beforeID (пагинация назад) или последние, включая вложения.
-func (s *Store) ListMessages(ctx context.Context, chatID uuid.UUID, topicID int64, beforeID int64, limit int) ([]Message, error) {
+// Сообщения, удалённые для всех или скрытые пользователем (message_deletions), исключаются.
+func (s *Store) ListMessages(ctx context.Context, chatID uuid.UUID, topicID int64, beforeID int64, limit int, forUserID string) ([]Message, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 50
 	}
@@ -534,20 +560,32 @@ func (s *Store) ListMessages(ctx context.Context, chatID uuid.UUID, topicID int6
 
 	if beforeID > 0 {
 		rows, err = s.pool.Query(ctx, `
-			SELECT id, chat_id, topic_id, sender_id, sender_name, client_msg_id, reply_to_id, body, kind, secret_ttl_seconds, secret_read_at, metadata, created_at, edited_at, deleted_at
-			FROM messages
-			WHERE chat_id = $1 AND topic_id = $2 AND id < $3
-			ORDER BY id DESC
-			LIMIT $4
-		`, chatID, topicID, beforeID, limit)
+			SELECT m.id, m.chat_id, m.topic_id, m.sender_id, m.sender_name, m.client_msg_id, m.reply_to_id, m.body, m.kind, m.secret_ttl_seconds, m.secret_read_at, m.metadata, m.created_at, m.edited_at, m.deleted_at,
+			       r.id, r.sender_id, r.sender_name, r.body
+			FROM messages m
+			LEFT JOIN messages r ON m.reply_to_id = r.id AND r.deleted_at IS NULL
+			WHERE m.chat_id = $1 AND m.topic_id = $2 AND m.id < $3
+			  AND m.deleted_at IS NULL
+			  AND NOT EXISTS (
+			      SELECT 1 FROM message_deletions md WHERE md.message_id = m.id AND md.user_id = $4
+			  )
+			ORDER BY m.id DESC
+			LIMIT $5
+		`, chatID, topicID, beforeID, forUserID, limit)
 	} else {
 		rows, err = s.pool.Query(ctx, `
-			SELECT id, chat_id, topic_id, sender_id, sender_name, client_msg_id, reply_to_id, body, kind, secret_ttl_seconds, secret_read_at, metadata, created_at, edited_at, deleted_at
-			FROM messages
-			WHERE chat_id = $1 AND topic_id = $2
-			ORDER BY id DESC
-			LIMIT $3
-		`, chatID, topicID, limit)
+			SELECT m.id, m.chat_id, m.topic_id, m.sender_id, m.sender_name, m.client_msg_id, m.reply_to_id, m.body, m.kind, m.secret_ttl_seconds, m.secret_read_at, m.metadata, m.created_at, m.edited_at, m.deleted_at,
+			       r.id, r.sender_id, r.sender_name, r.body
+			FROM messages m
+			LEFT JOIN messages r ON m.reply_to_id = r.id AND r.deleted_at IS NULL
+			WHERE m.chat_id = $1 AND m.topic_id = $2
+			  AND m.deleted_at IS NULL
+			  AND NOT EXISTS (
+			      SELECT 1 FROM message_deletions md WHERE md.message_id = m.id AND md.user_id = $3
+			  )
+			ORDER BY m.id DESC
+			LIMIT $4
+		`, chatID, topicID, forUserID, limit)
 	}
 	if err != nil {
 		return nil, err
@@ -559,11 +597,25 @@ func (s *Store) ListMessages(ctx context.Context, chatID uuid.UUID, topicID int6
 	for rows.Next() {
 		var m Message
 		var metaRaw []byte
-		if err := rows.Scan(&m.ID, &m.ChatID, &m.TopicID, &m.SenderID, &m.SenderName, &m.ClientMsgID, &m.ReplyToID, &m.Body, &m.Kind, &m.SecretTTLSeconds, &m.SecretReadAt, &metaRaw, &m.CreatedAt, &m.EditedAt, &m.DeletedAt); err != nil {
+		var rID *int64
+		var rSenderID, rSenderName, rBody *string
+		if err := rows.Scan(
+			&m.ID, &m.ChatID, &m.TopicID, &m.SenderID, &m.SenderName, &m.ClientMsgID, &m.ReplyToID,
+			&m.Body, &m.Kind, &m.SecretTTLSeconds, &m.SecretReadAt, &metaRaw, &m.CreatedAt, &m.EditedAt, &m.DeletedAt,
+			&rID, &rSenderID, &rSenderName, &rBody,
+		); err != nil {
 			return nil, err
 		}
 		if len(metaRaw) > 0 {
 			_ = json.Unmarshal(metaRaw, &m.Metadata)
+		}
+		if rID != nil {
+			m.ReplyTo = &ReplyPreview{
+				ID:         *rID,
+				SenderID:   derefString(rSenderID),
+				SenderName: derefString(rSenderName),
+				Body:       derefString(rBody),
+			}
 		}
 		msgs = append(msgs, m)
 		msgIDs = append(msgIDs, m.ID)
@@ -601,6 +653,163 @@ func (s *Store) ListMessages(ctx context.Context, chatID uuid.UUID, topicID int6
 	}
 
 	return msgs, rows.Err()
+}
+
+// GetMessage возвращает сообщение по ID со вложениями
+func (s *Store) GetMessage(ctx context.Context, messageID int64) (*Message, error) {
+	var m Message
+	var metaRaw []byte
+	err := s.pool.QueryRow(ctx, `
+		SELECT id, chat_id, topic_id, sender_id, sender_name, client_msg_id, reply_to_id, body, kind, secret_ttl_seconds, secret_read_at, metadata, created_at, edited_at, deleted_at
+		FROM messages
+		WHERE id = $1
+	`, messageID).Scan(
+		&m.ID, &m.ChatID, &m.TopicID, &m.SenderID, &m.SenderName, &m.ClientMsgID, &m.ReplyToID,
+		&m.Body, &m.Kind, &m.SecretTTLSeconds, &m.SecretReadAt, &metaRaw, &m.CreatedAt, &m.EditedAt, &m.DeletedAt,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrMessageNotFound
+		}
+		return nil, err
+	}
+	if len(metaRaw) > 0 {
+		_ = json.Unmarshal(metaRaw, &m.Metadata)
+	}
+
+	attRows, aErr := s.pool.Query(ctx, `
+		SELECT id, message_id, chat_id, file_name, file_size, content_type, storage_path, sha256_hex, created_at
+		FROM attachments WHERE message_id = $1
+	`, m.ID)
+	if aErr == nil {
+		defer attRows.Close()
+		for attRows.Next() {
+			var a Attachment
+			if scanErr := attRows.Scan(&a.ID, &a.MessageID, &a.ChatID, &a.FileName, &a.FileSize, &a.ContentType, &a.StoragePath, &a.SHA256Hex, &a.CreatedAt); scanErr == nil {
+				m.Attachments = append(m.Attachments, a)
+			}
+		}
+	}
+	return &m, nil
+}
+
+// DeleteMessage удаляет сообщение: для всех (soft delete) или только у себя (message_deletions)
+func (s *Store) DeleteMessage(ctx context.Context, chatID uuid.UUID, messageID int64, userID string, forEveryone bool, isAdminOrMod bool) (*Message, error) {
+	var msg Message
+	err := s.pool.QueryRow(ctx, `
+		SELECT id, chat_id, topic_id, sender_id, sender_name, body, deleted_at
+		FROM messages
+		WHERE id = $1 AND chat_id = $2
+	`, messageID, chatID).Scan(&msg.ID, &msg.ChatID, &msg.TopicID, &msg.SenderID, &msg.SenderName, &msg.Body, &msg.DeletedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrMessageNotFound
+		}
+		return nil, fmt.Errorf("store: get message for delete: %w", err)
+	}
+
+	if forEveryone {
+		if msg.SenderID != userID && !isAdminOrMod {
+			return nil, ErrForbidden
+		}
+		_, err = s.pool.Exec(ctx, `
+			UPDATE messages
+			SET deleted_at = NOW()
+			WHERE id = $1 AND chat_id = $2
+		`, messageID, chatID)
+		if err != nil {
+			return nil, fmt.Errorf("store: soft delete message: %w", err)
+		}
+	} else {
+		_, err = s.pool.Exec(ctx, `
+			INSERT INTO message_deletions (user_id, message_id, chat_id, deleted_at)
+			VALUES ($1, $2, $3, NOW())
+			ON CONFLICT (user_id, message_id) DO NOTHING
+		`, userID, messageID, chatID)
+		if err != nil {
+			return nil, fmt.Errorf("store: insert message deletion: %w", err)
+		}
+	}
+
+	return &msg, nil
+}
+
+// EditMessage редактирует текст сообщения (только автор)
+func (s *Store) EditMessage(ctx context.Context, chatID uuid.UUID, messageID int64, userID string, newBody string) (*Message, error) {
+	var msg Message
+	var metaRaw []byte
+	err := s.pool.QueryRow(ctx, `
+		SELECT id, chat_id, topic_id, sender_id, sender_name, client_msg_id, reply_to_id, body, kind, metadata, created_at, edited_at, deleted_at
+		FROM messages
+		WHERE id = $1 AND chat_id = $2
+	`, messageID, chatID).Scan(
+		&msg.ID, &msg.ChatID, &msg.TopicID, &msg.SenderID, &msg.SenderName, &msg.ClientMsgID, &msg.ReplyToID,
+		&msg.Body, &msg.Kind, &metaRaw, &msg.CreatedAt, &msg.EditedAt, &msg.DeletedAt,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrMessageNotFound
+		}
+		return nil, fmt.Errorf("store: get message for edit: %w", err)
+	}
+
+	if msg.SenderID != userID {
+		return nil, ErrForbidden
+	}
+	if msg.DeletedAt != nil {
+		return nil, ErrCannotEdit
+	}
+	if msg.Kind != MsgKindText && msg.Kind != "file" {
+		return nil, ErrCannotEdit
+	}
+
+	cleanBody := strings.TrimSpace(newBody)
+	if cleanBody == "" {
+		return nil, errors.New("empty_body")
+	}
+
+	var editedAt time.Time
+	err = s.pool.QueryRow(ctx, `
+		UPDATE messages
+		SET body = $1, edited_at = NOW()
+		WHERE id = $2 AND chat_id = $3
+		RETURNING edited_at
+	`, cleanBody, messageID, chatID).Scan(&editedAt)
+	if err != nil {
+		return nil, fmt.Errorf("store: update message body: %w", err)
+	}
+
+	msg.Body = cleanBody
+	msg.EditedAt = &editedAt
+	if len(metaRaw) > 0 {
+		_ = json.Unmarshal(metaRaw, &msg.Metadata)
+	}
+
+	if msg.ReplyToID != nil && *msg.ReplyToID > 0 {
+		var r ReplyPreview
+		if rErr := s.pool.QueryRow(ctx, `
+			SELECT id, sender_id, sender_name, body
+			FROM messages WHERE id = $1 AND chat_id = $2 AND deleted_at IS NULL
+		`, *msg.ReplyToID, msg.ChatID).Scan(&r.ID, &r.SenderID, &r.SenderName, &r.Body); rErr == nil {
+			msg.ReplyTo = &r
+		}
+	}
+
+	attRows, aErr := s.pool.Query(ctx, `
+		SELECT id, message_id, chat_id, file_name, file_size, content_type, storage_path, sha256_hex, created_at
+		FROM attachments WHERE message_id = $1
+	`, msg.ID)
+	if aErr == nil {
+		defer attRows.Close()
+		for attRows.Next() {
+			var a Attachment
+			if scanErr := attRows.Scan(&a.ID, &a.MessageID, &a.ChatID, &a.FileName, &a.FileSize, &a.ContentType, &a.StoragePath, &a.SHA256Hex, &a.CreatedAt); scanErr == nil {
+				msg.Attachments = append(msg.Attachments, a)
+			}
+		}
+	}
+
+	return &msg, nil
 }
 
 // UpdateReadPointer смещает High-Water Mark указатель прочтения (только вперёд!).
@@ -815,11 +1024,14 @@ func (s *Store) ListMissedMessagesForUser(ctx context.Context, userID string, gr
 	isAdmin := role == "chat_admin" || role == "admin" || role == "superadmin"
 
 	query := `
-		SELECT m.id, m.chat_id, m.topic_id, m.sender_id, m.sender_name, m.client_msg_id, m.reply_to_id, m.body, m.kind, m.secret_ttl_seconds, m.secret_read_at, m.metadata, m.created_at, m.edited_at, m.deleted_at
+		SELECT m.id, m.chat_id, m.topic_id, m.sender_id, m.sender_name, m.client_msg_id, m.reply_to_id, m.body, m.kind, m.secret_ttl_seconds, m.secret_read_at, m.metadata, m.created_at, m.edited_at, m.deleted_at,
+		       r.id, r.sender_id, r.sender_name, r.body
 		FROM messages m
 		JOIN chats c ON c.id = m.chat_id
+		LEFT JOIN messages r ON m.reply_to_id = r.id AND r.deleted_at IS NULL
 		WHERE m.id > $1
 		  AND m.deleted_at IS NULL
+		  AND NOT EXISTS (SELECT 1 FROM message_deletions md WHERE md.message_id = m.id AND md.user_id = $2)
 		  AND c.is_archived = FALSE
 		  AND (
 		      $3 = TRUE
@@ -848,11 +1060,25 @@ func (s *Store) ListMissedMessagesForUser(ctx context.Context, userID string, gr
 	for rows.Next() {
 		var m Message
 		var metaRaw []byte
-		if err := rows.Scan(&m.ID, &m.ChatID, &m.TopicID, &m.SenderID, &m.SenderName, &m.ClientMsgID, &m.ReplyToID, &m.Body, &m.Kind, &m.SecretTTLSeconds, &m.SecretReadAt, &metaRaw, &m.CreatedAt, &m.EditedAt, &m.DeletedAt); err != nil {
+		var rID *int64
+		var rSenderID, rSenderName, rBody *string
+		if err := rows.Scan(
+			&m.ID, &m.ChatID, &m.TopicID, &m.SenderID, &m.SenderName, &m.ClientMsgID, &m.ReplyToID,
+			&m.Body, &m.Kind, &m.SecretTTLSeconds, &m.SecretReadAt, &metaRaw, &m.CreatedAt, &m.EditedAt, &m.DeletedAt,
+			&rID, &rSenderID, &rSenderName, &rBody,
+		); err != nil {
 			return nil, err
 		}
 		if len(metaRaw) > 0 {
 			_ = json.Unmarshal(metaRaw, &m.Metadata)
+		}
+		if rID != nil {
+			m.ReplyTo = &ReplyPreview{
+				ID:         *rID,
+				SenderID:   derefString(rSenderID),
+				SenderName: derefString(rSenderName),
+				Body:       derefString(rBody),
+			}
 		}
 		msgs = append(msgs, m)
 		msgIDs = append(msgIDs, m.ID)

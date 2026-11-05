@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -334,7 +335,7 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	msgs, err := s.st.ListMessages(r.Context(), chatID, topicID, beforeID, limit)
+	msgs, err := s.st.ListMessages(r.Context(), chatID, topicID, beforeID, limit, userID)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed_to_list_messages"})
 		return
@@ -350,6 +351,7 @@ type sendMessageReq struct {
 	TopicID          int64          `json:"topic_id"`
 	ClientMsgID      string         `json:"client_msg_id"`
 	ReplyToID        *int64         `json:"reply_to_id"`
+	ForwardMessageID *int64         `json:"forward_message_id,omitempty"`
 	Body             string         `json:"body"`
 	Kind             string         `json:"kind"`
 	SecretTTLSeconds *int           `json:"secret_ttl_seconds"`
@@ -416,6 +418,38 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Обработка пересылки сообщения (forward)
+	if req.ForwardMessageID != nil && *req.ForwardMessageID > 0 {
+		orig, origErr := s.st.GetMessage(r.Context(), *req.ForwardMessageID)
+		if origErr != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "forward_message_not_found"})
+			return
+		}
+		// Проверяем доступ пользователя к исходному чату
+		canAccessOrig, _, cErr := s.st.CanAccessChat(r.Context(), orig.ChatID, userID, claims.ADGroups, claims.Department, claims.Role)
+		if cErr != nil || !canAccessOrig {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "cannot_forward_from_chat"})
+			return
+		}
+		if req.Metadata == nil {
+			req.Metadata = make(map[string]any)
+		}
+		req.Metadata["forward"] = map[string]any{
+			"original_message_id": orig.ID,
+			"original_chat_id":    orig.ChatID.String(),
+			"sender_id":           orig.SenderID,
+			"sender_name":         orig.SenderName,
+		}
+		if strings.TrimSpace(req.Body) == "" {
+			req.Body = orig.Body
+		}
+		if len(parsedAttIDs) == 0 && len(orig.Attachments) > 0 {
+			for _, att := range orig.Attachments {
+				parsedAttIDs = append(parsedAttIDs, att.ID)
+			}
+		}
+	}
+
 	req.Body = strings.TrimSpace(req.Body)
 	if req.Body == "" && len(parsedAttIDs) == 0 && req.Kind != store.MsgKindLinkCall {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "empty_body"})
@@ -473,6 +507,166 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 	})
 
 	writeJSON(w, http.StatusCreated, msg)
+}
+
+type deleteMessageReq struct {
+	ForEveryone bool `json:"for_everyone"`
+}
+
+// handleDeleteMessage — DELETE /api/v1/chats/{id}/messages/{msg_id}
+func (s *Server) handleDeleteMessage(w http.ResponseWriter, r *http.Request) {
+	claims, _ := claimsFromContext(r.Context())
+	userID := getUserID(claims)
+	chatIDStr := r.PathValue("id")
+	chatID, err := uuid.Parse(chatIDStr)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_chat_id"})
+		return
+	}
+	msgIDStr := r.PathValue("msg_id")
+	msgID, err := strconv.ParseInt(msgIDStr, 10, 64)
+	if err != nil || msgID <= 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_message_id"})
+		return
+	}
+
+	ok, role, err := s.st.CanAccessChat(r.Context(), chatID, userID, claims.ADGroups, claims.Department, claims.Role)
+	if err != nil || !ok {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "access_denied"})
+		return
+	}
+
+	forEveryone := false
+	if r.URL.Query().Get("for_everyone") == "true" || r.URL.Query().Get("for_everyone") == "1" {
+		forEveryone = true
+	}
+	if !forEveryone && r.Body != nil && r.ContentLength > 0 {
+		var req deleteMessageReq
+		if err := json.NewDecoder(r.Body).Decode(&req); err == nil {
+			forEveryone = req.ForEveryone
+		}
+	}
+
+	isAdminOrMod := (role == store.MemberRoleAdmin || role == store.MemberRoleModerator || claims.Role == "admin" || claims.Role == "superadmin")
+
+	deletedMsg, dErr := s.st.DeleteMessage(r.Context(), chatID, msgID, userID, forEveryone, isAdminOrMod)
+	if dErr != nil {
+		if errors.Is(dErr, store.ErrForbidden) {
+			writeJSON(w, http.StatusForbidden, map[string]string{
+				"error":   "forbidden",
+				"message": "Недостаточно прав для удаления этого сообщения у всех участников",
+			})
+			return
+		}
+		if errors.Is(dErr, store.ErrMessageNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "message_not_found"})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed_to_delete_message"})
+		return
+	}
+
+	if forEveryone {
+		s.hub.BroadcastToRoom("chat:"+chatID.String(), HubMessage{
+			Type:    "chat.message_deleted",
+			ChatID:  chatID.String(),
+			TopicID: deletedMsg.TopicID,
+			Payload: map[string]any{
+				"message_id":   msgID,
+				"for_everyone": true,
+				"deleted_by":   userID,
+			},
+		})
+	} else {
+		s.hub.SendDirect(userID, HubMessage{
+			Type:    "chat.message_deleted",
+			ChatID:  chatID.String(),
+			TopicID: deletedMsg.TopicID,
+			Payload: map[string]any{
+				"message_id":   msgID,
+				"for_everyone": false,
+				"deleted_by":   userID,
+			},
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":       "deleted",
+		"message_id":   msgID,
+		"for_everyone": forEveryone,
+	})
+}
+
+type editMessageReq struct {
+	Body string `json:"body"`
+}
+
+// handleEditMessage — PUT /api/v1/chats/{id}/messages/{msg_id}
+func (s *Server) handleEditMessage(w http.ResponseWriter, r *http.Request) {
+	claims, _ := claimsFromContext(r.Context())
+	userID := getUserID(claims)
+	chatIDStr := r.PathValue("id")
+	chatID, err := uuid.Parse(chatIDStr)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_chat_id"})
+		return
+	}
+	msgIDStr := r.PathValue("msg_id")
+	msgID, err := strconv.ParseInt(msgIDStr, 10, 64)
+	if err != nil || msgID <= 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_message_id"})
+		return
+	}
+
+	ok, role, err := s.st.CanAccessChat(r.Context(), chatID, userID, claims.ADGroups, claims.Department, claims.Role)
+	if err != nil || !ok {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "access_denied"})
+		return
+	}
+	if role == "viewer" || role == store.MemberRoleReadOnly {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "read_only_mode"})
+		return
+	}
+
+	var req editMessageReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
+		return
+	}
+	req.Body = strings.TrimSpace(req.Body)
+	if req.Body == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "empty_body"})
+		return
+	}
+
+	updatedMsg, eErr := s.st.EditMessage(r.Context(), chatID, msgID, userID, req.Body)
+	if eErr != nil {
+		if errors.Is(eErr, store.ErrForbidden) {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "forbidden", "message": "Вы можете редактировать только свои сообщения"})
+			return
+		}
+		if errors.Is(eErr, store.ErrMessageNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "message_not_found"})
+			return
+		}
+		if errors.Is(eErr, store.ErrCannotEdit) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "cannot_edit"})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed_to_edit_message"})
+		return
+	}
+
+	s.hub.BroadcastToRoom("chat:"+chatID.String(), HubMessage{
+		Type:    "chat.message_updated",
+		ChatID:  chatID.String(),
+		TopicID: updatedMsg.TopicID,
+		Payload: map[string]any{
+			"message": updatedMsg,
+		},
+	})
+
+	writeJSON(w, http.StatusOK, updatedMsg)
 }
 
 type readPointerReq struct {

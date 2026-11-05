@@ -71,6 +71,14 @@ type ChatTopic struct {
 	UnreadCount int       `json:"unread_count"`
 }
 
+// ReplyPreview содержит превью цитируемого сообщения
+type ReplyPreview struct {
+	ID         int64  `json:"id"`
+	SenderID   string `json:"sender_id"`
+	SenderName string `json:"sender_name"`
+	Body       string `json:"body"`
+}
+
 // Message представляет отдельное сообщение
 type Message struct {
 	ID               int64          `json:"id"`
@@ -80,6 +88,7 @@ type Message struct {
 	SenderName       string         `json:"sender_name"`
 	ClientMsgID      string         `json:"client_msg_id"`
 	ReplyToID        *int64         `json:"reply_to_id,omitempty"`
+	ReplyTo          *ReplyPreview  `json:"reply_to,omitempty"`
 	Body             string         `json:"body"`
 	Kind             string         `json:"kind"`
 	SecretTTLSeconds *int           `json:"secret_ttl_seconds,omitempty"`
