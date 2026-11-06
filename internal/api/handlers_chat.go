@@ -236,9 +236,17 @@ func (s *Server) handleListTopics(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, topics)
 }
 
+func isChatManager(role, globalRole string) bool {
+	return role == store.MemberRoleAdmin || role == store.MemberRoleModerator ||
+		globalRole == "admin" || globalRole == "superadmin" || globalRole == "chat_admin" ||
+		globalRole == "moderator" || globalRole == "operator"
+}
+
 type createTopicReq struct {
 	Title     string `json:"title"`
 	IconEmoji string `json:"icon_emoji"`
+	IsPinned  *bool  `json:"is_pinned,omitempty"`
+	IsClosed  *bool  `json:"is_closed,omitempty"`
 }
 
 // handleCreateTopic — POST /api/v1/chats/{id}/topics
@@ -284,6 +292,15 @@ func (s *Server) handleCreateTopic(w http.ResponseWriter, r *http.Request) {
 		CreatedBy: userID,
 	}
 
+	if isChatManager(role, claims.Role) {
+		if req.IsPinned != nil {
+			topic.IsPinned = *req.IsPinned
+		}
+		if req.IsClosed != nil {
+			topic.IsClosed = *req.IsClosed
+		}
+	}
+
 	if err := s.st.CreateTopic(r.Context(), topic); err != nil {
 		if store.IsUniqueViolation(err) {
 			writeJSON(w, http.StatusConflict, map[string]string{"error": "topic_already_exists"})
@@ -302,6 +319,141 @@ func (s *Server) handleCreateTopic(w http.ResponseWriter, r *http.Request) {
 	})
 
 	writeJSON(w, http.StatusCreated, topic)
+}
+
+type updateTopicReq struct {
+	Title     string `json:"title"`
+	IconEmoji string `json:"icon_emoji"`
+	IsPinned  *bool  `json:"is_pinned"`
+	IsClosed  *bool  `json:"is_closed"`
+}
+
+// handleUpdateTopic — PATCH / PUT /api/v1/chats/{id}/topics/{topic_id}
+func (s *Server) handleUpdateTopic(w http.ResponseWriter, r *http.Request) {
+	claims, _ := claimsFromContext(r.Context())
+	userID := getUserID(claims)
+	chatIDStr := r.PathValue("id")
+	chatID, err := uuid.Parse(chatIDStr)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_chat_id"})
+		return
+	}
+	topicIDStr := r.PathValue("topic_id")
+	topicID, err := strconv.ParseInt(topicIDStr, 10, 64)
+	if err != nil || topicID <= 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_topic_id"})
+		return
+	}
+
+	ok, role, err := s.st.CanAccessChat(r.Context(), chatID, userID, claims.ADGroups, claims.Department, claims.Role)
+	if err != nil || !ok {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "access_denied"})
+		return
+	}
+
+	topic, err := s.st.GetTopic(r.Context(), chatID, topicID)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "topic_not_found"})
+		return
+	}
+
+	var req updateTopicReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
+		return
+	}
+
+	isManager := isChatManager(role, claims.Role)
+	if !isManager {
+		// Обычные участники не могут управлять чужими темами и не могут менять статус pinned / closed
+		if topic.CreatedBy != userID || req.IsPinned != nil || req.IsClosed != nil {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "admin_or_moderator_required"})
+			return
+		}
+	}
+
+	req.Title = strings.TrimSpace(req.Title)
+	if req.Title == "" {
+		req.Title = topic.Title
+	}
+	if req.IconEmoji == "" {
+		req.IconEmoji = topic.IconEmoji
+	}
+
+	updated, err := s.st.UpdateTopic(r.Context(), chatID, topicID, req.Title, req.IconEmoji, req.IsPinned, req.IsClosed)
+	if err != nil {
+		if store.IsUniqueViolation(err) {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "topic_title_exists"})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed_to_update_topic"})
+		return
+	}
+
+	// Транслируем обновление темы участникам
+	s.hub.BroadcastToRoom("chat:"+chatID.String(), HubMessage{
+		Type:    "chat.topic_updated",
+		ChatID:  chatID.String(),
+		TopicID: updated.ID,
+		Payload: map[string]any{"topic": updated},
+	})
+
+	writeJSON(w, http.StatusOK, updated)
+}
+
+// handleDeleteTopic — DELETE /api/v1/chats/{id}/topics/{topic_id}
+func (s *Server) handleDeleteTopic(w http.ResponseWriter, r *http.Request) {
+	claims, _ := claimsFromContext(r.Context())
+	userID := getUserID(claims)
+	chatIDStr := r.PathValue("id")
+	chatID, err := uuid.Parse(chatIDStr)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_chat_id"})
+		return
+	}
+	topicIDStr := r.PathValue("topic_id")
+	topicID, err := strconv.ParseInt(topicIDStr, 10, 64)
+	if err != nil || topicID <= 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_topic_id"})
+		return
+	}
+
+	ok, role, err := s.st.CanAccessChat(r.Context(), chatID, userID, claims.ADGroups, claims.Department, claims.Role)
+	if err != nil || !ok {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "access_denied"})
+		return
+	}
+
+	topic, err := s.st.GetTopic(r.Context(), chatID, topicID)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "topic_not_found"})
+		return
+	}
+
+	if topic.IsGeneral {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "cannot_delete_general_topic"})
+		return
+	}
+
+	isManager := isChatManager(role, claims.Role)
+	if !isManager && topic.CreatedBy != userID {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "admin_or_moderator_required"})
+		return
+	}
+
+	if err := s.st.DeleteTopic(r.Context(), chatID, topicID); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed_to_delete_topic"})
+		return
+	}
+
+	s.hub.BroadcastToRoom("chat:"+chatID.String(), HubMessage{
+		Type:    "chat.topic_deleted",
+		ChatID:  chatID.String(),
+		TopicID: topicID,
+		Payload: map[string]any{"topic_id": topicID},
+	})
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 // handleListMessages — GET /api/v1/chats/{id}/messages
@@ -387,6 +539,19 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
 		return
+	}
+
+	// Проверяем статус топика форума (если отправка в топик)
+	if req.TopicID > 0 {
+		topic, tErr := s.st.GetTopic(r.Context(), chatID, req.TopicID)
+		if tErr != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "topic_not_found"})
+			return
+		}
+		if topic.IsClosed && !isChatManager(role, claims.Role) {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "topic_closed"})
+			return
+		}
 	}
 
 	// Извлекаем вложения из attachment_ids, attachments или metadata

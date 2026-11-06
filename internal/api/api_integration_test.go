@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -243,6 +244,81 @@ func TestIntegration_Chat_Forum_Topics_HighWaterMark(t *testing.T) {
 				t.Fatalf("expected unread_count == 0 after reading, got %d", tp.UnreadCount)
 			}
 		}
+	}
+
+	// 8. Администратор (Иванов) обновляет тему: закрепляет и закрывает её
+	pinTrue := true
+	closeTrue := true
+	updBody, _ := json.Marshal(map[string]any{
+		"title":      "Серверы (Архив)",
+		"icon_emoji": "🔒",
+		"is_pinned":  &pinTrue,
+		"is_closed":  &closeTrue,
+	})
+	req = httptest.NewRequest(http.MethodPatch, "/api/v1/chats/"+createdChat.ID.String()+"/topics/"+strconv.FormatInt(serverTopic.ID, 10), bytes.NewReader(updBody))
+	req.Header.Set("Authorization", "Bearer "+ivanovToken)
+	w = httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("update topic: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var updatedTopic store.ChatTopic
+	_ = json.Unmarshal(w.Body.Bytes(), &updatedTopic)
+	if !updatedTopic.IsPinned || !updatedTopic.IsClosed || updatedTopic.Title != "Серверы (Архив)" {
+		t.Fatalf("unexpected updated topic: %+v", updatedTopic)
+	}
+
+	// 9. Петров (обычный участник) пытается написать в закрытую тему: должен получить 403 topic_closed
+	blockedMsgBody, _ := json.Marshal(map[string]any{
+		"topic_id": serverTopic.ID,
+		"body":     "Попытка написать в закрытую тему",
+	})
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/chats/"+createdChat.ID.String()+"/messages", bytes.NewReader(blockedMsgBody))
+	req.Header.Set("Authorization", "Bearer "+petrovToken)
+	w = httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 on closed topic for member, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// 10. Иванов (администратор) может писать в закрытую тему
+	adminMsgBody, _ := json.Marshal(map[string]any{
+		"topic_id": serverTopic.ID,
+		"body":     "Администратор закрыл тему",
+	})
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/chats/"+createdChat.ID.String()+"/messages", bytes.NewReader(adminMsgBody))
+	req.Header.Set("Authorization", "Bearer "+ivanovToken)
+	w = httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+	if w.Code != http.StatusOK && w.Code != http.StatusCreated {
+		t.Fatalf("expected 200/201 on closed topic for admin, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// 11. Попытка удалить тему "Общий" (is_general): должно вернуть 400 cannot_delete_general_topic
+	var generalTopic *store.ChatTopic
+	for _, tp := range updatedTopics {
+		if tp.IsGeneral {
+			generalTopic = &tp
+			break
+		}
+	}
+	if generalTopic != nil {
+		req = httptest.NewRequest(http.MethodDelete, "/api/v1/chats/"+createdChat.ID.String()+"/topics/"+strconv.FormatInt(generalTopic.ID, 10), nil)
+		req.Header.Set("Authorization", "Bearer "+ivanovToken)
+		w = httptest.NewRecorder()
+		srv.ServeHTTP(w, req)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 when deleting general topic, got %d: %s", w.Code, w.Body.String())
+		}
+	}
+
+	// 12. Удаление кастомной темы "Серверы": 200 OK
+	req = httptest.NewRequest(http.MethodDelete, "/api/v1/chats/"+createdChat.ID.String()+"/topics/"+strconv.FormatInt(serverTopic.ID, 10), nil)
+	req.Header.Set("Authorization", "Bearer "+ivanovToken)
+	w = httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 when deleting custom topic, got %d: %s", w.Code, w.Body.String())
 	}
 }
 

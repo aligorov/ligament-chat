@@ -54,6 +54,7 @@ type Chat struct {
 	UpdatedAt   time.Time `json:"updated_at"`
 	UnreadCount int       `json:"unread_count"`
 	PeerUserID  string    `json:"peer_user_id,omitempty"`
+	MyRole      string    `json:"my_role,omitempty"`
 }
 
 // ChatTopic представляет топик (тему) в форуме

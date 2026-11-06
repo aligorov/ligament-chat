@@ -243,9 +243,10 @@ func (s *Store) GetChat(ctx context.Context, chatID uuid.UUID, forUserID string)
 		           ELSE c.title
 		       END AS title,
 		       c.description, c.avatar_url, c.is_forum, c.is_archived, c.created_by, c.created_at, c.updated_at,
-		       COALESCE((SELECT cm_peer.user_id FROM chat_members cm_peer WHERE cm_peer.chat_id = c.id AND cm_peer.user_id != $2 LIMIT 1), '') AS peer_user_id
+		       COALESCE((SELECT cm_peer.user_id FROM chat_members cm_peer WHERE cm_peer.chat_id = c.id AND cm_peer.user_id != $2 LIMIT 1), '') AS peer_user_id,
+		       COALESCE((SELECT cm.role FROM chat_members cm WHERE cm.chat_id = c.id AND cm.user_id = $2 LIMIT 1), 'member') AS my_role
 		FROM chats c WHERE c.id = $1
-	`, chatID, forUserID).Scan(&c.ID, &c.Kind, &c.Title, &c.Description, &c.AvatarURL, &c.IsForum, &c.IsArchived, &c.CreatedBy, &c.CreatedAt, &c.UpdatedAt, &c.PeerUserID)
+	`, chatID, forUserID).Scan(&c.ID, &c.Kind, &c.Title, &c.Description, &c.AvatarURL, &c.IsForum, &c.IsArchived, &c.CreatedBy, &c.CreatedAt, &c.UpdatedAt, &c.PeerUserID, &c.MyRole)
 	if err != nil {
 		return nil, err
 	}
@@ -399,7 +400,22 @@ func (s *Store) ListUserChats(ctx context.Context, userID string, groups []strin
 		           LEFT JOIN topic_participants tp ON tp.chat_id = m.chat_id AND tp.topic_id = m.topic_id AND tp.user_id = $1
 		           WHERE m.chat_id = c.id AND m.id > COALESCE(tp.last_read_message_id, 0)
 		       ), 0) AS unread_count,
-		       COALESCE((SELECT cm_peer.user_id FROM chat_members cm_peer WHERE cm_peer.chat_id = c.id AND cm_peer.user_id != $1 LIMIT 1), '') AS peer_user_id
+		       COALESCE((SELECT cm_peer.user_id FROM chat_members cm_peer WHERE cm_peer.chat_id = c.id AND cm_peer.user_id != $1 LIMIT 1), '') AS peer_user_id,
+		       CASE
+		           WHEN $2 = TRUE THEN 'admin'
+		           WHEN $5 = 'moderator' OR $5 = 'operator' THEN 'moderator'
+		           ELSE COALESCE(
+		               (SELECT cm.role FROM chat_members cm WHERE cm.chat_id = c.id AND cm.user_id = $1 LIMIT 1),
+		               (SELECT CASE WHEN bool_or(gar.is_moderator) THEN 'moderator' WHEN bool_or(gar.can_write) THEN 'member' ELSE 'viewer' END
+		                FROM group_access_rules gar
+		                WHERE gar.chat_id = c.id AND (
+		                    (gar.rule_type = 'ad_group' AND gar.target_name = ANY($3))
+		                    OR (gar.rule_type = 'department' AND gar.target_name = $4)
+		                    OR (gar.rule_type = 'user' AND gar.target_name = $1)
+		                )),
+		               'member'
+		           )
+		       END AS my_role
 		FROM chats c
 		WHERE c.is_archived = FALSE AND (
 		    $2 = TRUE
@@ -416,7 +432,7 @@ func (s *Store) ListUserChats(ctx context.Context, userID string, groups []strin
 		ORDER BY c.updated_at DESC
 	`
 
-	rows, err := s.pool.Query(ctx, query, userID, isAdmin, groups, dept)
+	rows, err := s.pool.Query(ctx, query, userID, isAdmin, groups, dept, role)
 	if err != nil {
 		return nil, err
 	}
@@ -425,7 +441,7 @@ func (s *Store) ListUserChats(ctx context.Context, userID string, groups []strin
 	var chats []Chat
 	for rows.Next() {
 		var c Chat
-		if err := rows.Scan(&c.ID, &c.Kind, &c.Title, &c.Description, &c.AvatarURL, &c.IsForum, &c.IsArchived, &c.CreatedBy, &c.CreatedAt, &c.UpdatedAt, &c.UnreadCount, &c.PeerUserID); err != nil {
+		if err := rows.Scan(&c.ID, &c.Kind, &c.Title, &c.Description, &c.AvatarURL, &c.IsForum, &c.IsArchived, &c.CreatedBy, &c.CreatedAt, &c.UpdatedAt, &c.UnreadCount, &c.PeerUserID, &c.MyRole); err != nil {
 			return nil, err
 		}
 		chats = append(chats, c)
@@ -473,6 +489,87 @@ func (s *Store) ListChatTopics(ctx context.Context, chatID uuid.UUID, userID str
 		topics = append(topics, t)
 	}
 	return topics, rows.Err()
+}
+
+// GetTopic возвращает топик по ID в рамках чата.
+func (s *Store) GetTopic(ctx context.Context, chatID uuid.UUID, topicID int64) (*ChatTopic, error) {
+	var t ChatTopic
+	err := s.pool.QueryRow(ctx, `
+		SELECT id, chat_id, title, icon_emoji, is_general, is_closed, is_pinned, created_by, created_at, updated_at
+		FROM chat_topics
+		WHERE chat_id = $1 AND id = $2
+	`, chatID, topicID).Scan(&t.ID, &t.ChatID, &t.Title, &t.IconEmoji, &t.IsGeneral, &t.IsClosed, &t.IsPinned, &t.CreatedBy, &t.CreatedAt, &t.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &t, nil
+}
+
+// UpdateTopic обновляет заголовок, иконку, статус закрытия и закрепления топика.
+func (s *Store) UpdateTopic(ctx context.Context, chatID uuid.UUID, topicID int64, title, iconEmoji string, isPinned, isClosed *bool) (*ChatTopic, error) {
+	current, err := s.GetTopic(ctx, chatID, topicID)
+	if err != nil {
+		return nil, err
+	}
+	newTitle := current.Title
+	if trimmed := strings.TrimSpace(title); trimmed != "" {
+		newTitle = trimmed
+	}
+	newIcon := current.IconEmoji
+	if trimmed := strings.TrimSpace(iconEmoji); trimmed != "" {
+		newIcon = trimmed
+	}
+	newPinned := current.IsPinned
+	if isPinned != nil {
+		newPinned = *isPinned
+	}
+	newClosed := current.IsClosed
+	if isClosed != nil {
+		newClosed = *isClosed
+	}
+
+	var updated ChatTopic
+	err = s.pool.QueryRow(ctx, `
+		UPDATE chat_topics
+		SET title = $1, icon_emoji = $2, is_pinned = $3, is_closed = $4, updated_at = NOW()
+		WHERE chat_id = $5 AND id = $6
+		RETURNING id, chat_id, title, icon_emoji, is_general, is_closed, is_pinned, created_by, created_at, updated_at
+	`, newTitle, newIcon, newPinned, newClosed, chatID, topicID).Scan(
+		&updated.ID, &updated.ChatID, &updated.Title, &updated.IconEmoji, &updated.IsGeneral, &updated.IsClosed, &updated.IsPinned, &updated.CreatedBy, &updated.CreatedAt, &updated.UpdatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &updated, nil
+}
+
+// DeleteTopic удаляет топик и все связанные с ним сообщения и отметки прочтения.
+func (s *Store) DeleteTopic(ctx context.Context, chatID uuid.UUID, topicID int64) error {
+	topic, err := s.GetTopic(ctx, chatID, topicID)
+	if err != nil {
+		return err
+	}
+	if topic.IsGeneral {
+		return errors.New("cannot_delete_general_topic")
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, `DELETE FROM messages WHERE chat_id = $1 AND topic_id = $2`, chatID, topicID); err != nil {
+		return fmt.Errorf("delete topic messages: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM topic_participants WHERE chat_id = $1 AND topic_id = $2`, chatID, topicID); err != nil {
+		return fmt.Errorf("delete topic participants: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM chat_topics WHERE chat_id = $1 AND id = $2`, chatID, topicID); err != nil {
+		return fmt.Errorf("delete chat topic: %w", err)
+	}
+
+	return tx.Commit(ctx)
 }
 
 // SendMessage сохраняет сообщение в чат с монотонным ID и поддержкой идемпотентности.
@@ -834,6 +931,9 @@ func (s *Store) CanAccessChat(ctx context.Context, chatID uuid.UUID, userID stri
 	var memberRole string
 	err := s.pool.QueryRow(ctx, `SELECT role FROM chat_members WHERE chat_id = $1 AND user_id = $2`, chatID, userID).Scan(&memberRole)
 	if err == nil {
+		if (role == "moderator" || role == "operator") && memberRole == MemberRoleMember {
+			return true, MemberRoleModerator, nil
+		}
 		return true, memberRole, nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
@@ -853,7 +953,7 @@ func (s *Store) CanAccessChat(ctx context.Context, chatID uuid.UUID, userID stri
 	`, chatID, groups, dept, userID).Scan(&canWrite, &isMod)
 	if err == nil {
 		effective := MemberRoleMember
-		if isMod {
+		if isMod || role == "moderator" || role == "operator" {
 			effective = MemberRoleModerator
 		} else if !canWrite {
 			effective = "viewer"
